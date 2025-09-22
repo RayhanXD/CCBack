@@ -1,1 +1,1 @@
-web: chmod +x start.sh && ./start.sh
+web: uvicorn main:app --host 0.0.0.0 --port $PORT
