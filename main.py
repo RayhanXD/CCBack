@@ -21,11 +21,24 @@ app = FastAPI(
 )
 
 # CORS middleware
+allowed_origins = [
+    "http://localhost:3000",  # Local development
+    "http://localhost:8081",  # Expo development
+    "https://*.railway.app",  # Railway deployments
+    "https://*.vercel.app",   # Vercel deployments
+    "https://*.netlify.app",  # Netlify deployments
+]
+
+# Add frontend URL from environment if provided
+frontend_url = os.getenv("FRONTEND_URL")
+if frontend_url:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend URL
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -34,9 +47,29 @@ security = HTTPBearer()
 
 # Initialize Firebase Admin SDK
 try:
-    cred = credentials.Certificate("firebase-key.json")
+    # Check if running in Railway (production)
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        # Use environment variables for Railway
+        firebase_config = {
+            "type": "service_account",
+            "project_id": os.getenv("FIREBASE_PROJECT_ID"),
+            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
+            "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace('\\n', '\n'),
+            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
+            "client_id": os.getenv("FIREBASE_CLIENT_ID"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_X509_CERT_URL")
+        }
+        cred = credentials.Certificate(firebase_config)
+    else:
+        # Use local file for development
+        cred = credentials.Certificate("firebase-key.json")
+    
     firebase_admin.initialize_app(cred)
     db = firestore.client()
+    print("Firebase initialized successfully")
 except Exception as e:
     print(f"Firebase initialization error: {e}")
     db = None
@@ -159,13 +192,35 @@ major_colors = {
 # Load data function
 def load_data():
     try:
-        activities_df = pd.read_csv("CC_activities_ex.csv")
-        orgs_df = pd.read_csv("organizations_with_specific_majors.csv")
-        events_df = pd.read_csv("filtered_utd_events_with_categories.csv")
-        courses_df = pd.read_csv("utd_courses.csv")
-        tutoring_df = pd.read_excel("UTD_tutoring.xlsx", engine="openpyxl")
+        # Check if data files exist
+        data_files = [
+            "CC_activities_ex.csv",
+            "organizations_with_specific_majors.csv", 
+            "filtered_utd_events_with_categories.csv",
+            "utd_courses.csv",
+            "UTD_tutoring.xlsx"
+        ]
         
-        activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
+        missing_files = []
+        for file in data_files:
+            if not os.path.exists(file):
+                missing_files.append(file)
+        
+        if missing_files:
+            print(f"Warning: Missing data files: {missing_files}")
+            print("Some features may not work properly")
+        
+        # Load available files
+        activities_df = pd.read_csv("CC_activities_ex.csv") if os.path.exists("CC_activities_ex.csv") else None
+        orgs_df = pd.read_csv("organizations_with_specific_majors.csv") if os.path.exists("organizations_with_specific_majors.csv") else None
+        events_df = pd.read_csv("filtered_utd_events_with_categories.csv") if os.path.exists("filtered_utd_events_with_categories.csv") else None
+        courses_df = pd.read_csv("utd_courses.csv") if os.path.exists("utd_courses.csv") else None
+        tutoring_df = pd.read_excel("UTD_tutoring.xlsx", engine="openpyxl") if os.path.exists("UTD_tutoring.xlsx") else None
+        
+        if activities_df is not None and 'List of Interests' in activities_df.columns:
+            activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
+        
+        print("Data loaded successfully")
         return activities_df, tutoring_df, orgs_df, events_df, courses_df
     except Exception as e:
         print(f"Error loading data: {e}")
