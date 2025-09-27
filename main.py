@@ -12,6 +12,7 @@ from firebase_admin import credentials, auth, firestore
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional, Dict, Any
 import os
+from openai import OpenAI
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -74,6 +75,19 @@ except Exception as e:
     print(f"Firebase initialization error: {e}")
     db = None
 
+# Initialize OpenAI client
+try:
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key:
+        client = OpenAI(api_key=openai_api_key)
+        print("OpenAI client initialized successfully")
+    else:
+        print("Warning: OPENAI_API_KEY not found in environment variables")
+        client = None
+except Exception as e:
+    print(f"OpenAI initialization error: {e}")
+    client = None
+
 # Pydantic models
 class UserProfile(BaseModel):
     name: str
@@ -110,6 +124,10 @@ class TokenVerification(BaseModel):
 class RecommendationRequest(BaseModel):
     user_email: EmailStr
     category: str = "orgs"  # orgs, events, tutoring
+
+class ScholarshipRequest(BaseModel):
+    user_email: EmailStr
+    scholarships_data: List[Dict[str, Any]]
 
 # List of undergraduate majors offered at UTD
 majors = [
@@ -261,6 +279,64 @@ def extract_event_name(url):
     event_name = path.split("/event/")[-1] if "/event/" in path else ""
     event_name = event_name.replace("-", " ").title()
     return event_name
+
+def get_personalized_scholarships(user_data, scholarships_data):
+    """
+    Generate personalized scholarship recommendations using GPT-4
+    """
+    if not client:
+        print("OpenAI client not available")
+        return []
+    
+    # Construct a prompt for GPT
+    prompt = f"""
+    Given a student with the following profile:
+    - Major: {user_data.get('major', 'Undeclared')}
+    - Year: {user_data.get('year', '1')}
+    - GPA: {user_data.get('current_gpa', '0.0')}
+    - Race/Ethnicity: {user_data.get('race_ethnicity', 'Unknown')}
+    - Gender: {user_data.get('gender', 'Unknown')}
+    - First Generation Status: {user_data.get('ftcs_status', 'No')}
+    - Financial Factors: {user_data.get('financial_factors', 'N/A')}
+    
+    Review the following scholarships and return only the most relevant ones for this student. 
+    For each scholarship, provide a brief explanation of why it's a good match.
+    
+    Scholarships to evaluate:
+    {json.dumps(scholarships_data, indent=2)}
+    
+    Return the response in the following JSON format:
+    {{
+        "recommended_scholarships": [
+            {{
+                "name": "Scholarship Name",
+                "amount": "Amount",
+                "deadline": "YYYY-MM-DD",
+                "match_score": 85,
+                "explanation": "Brief reason for match",
+                "original_data": {{}}
+            }}
+        ]
+    }}
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a scholarship matching expert who helps students find the most relevant scholarships based on their profile."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+        
+        # Parse the response
+        recommendations = json.loads(response.choices[0].message.content)
+        return recommendations["recommended_scholarships"]
+    except Exception as e:
+        print(f"Error in getting scholarship recommendations: {e}")
+        return []
 
 # Dependency to get current user
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -604,6 +680,39 @@ async def get_recommendations(request: RecommendationRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating recommendations: {str(e)}")
+
+@app.post("/personalized-scholarships")
+async def get_personalized_scholarships_endpoint(request: ScholarshipRequest):
+    """
+    Generate personalized scholarship recommendations using GPT-4
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    if not client:
+        raise HTTPException(status_code=500, detail="OpenAI service not available")
+    
+    try:
+        # Get user data
+        user_doc = db.collection('users').document(request.user_email).get()
+        if not user_doc.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_data = user_doc.to_dict()
+        
+        # Get personalized scholarship recommendations
+        recommendations = get_personalized_scholarships(user_data, request.scholarships_data)
+        
+        return {
+            "recommendations": recommendations,
+            "user_email": request.user_email,
+            "total_recommendations": len(recommendations)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating personalized scholarships: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
