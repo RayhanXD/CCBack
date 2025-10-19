@@ -321,45 +321,72 @@ def home():
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
     if request.method == 'POST':
-        # Collect form data
-        user_data = {
-            'name': request.form['name'],
-            'surname': request.form['surname'],
-            'school_name': request.form['school_name'],
-            'year': request.form['year'],
-            'ftcs_status': request.form['ftcs_status'],
-            'gpa_range': request.form['gpa_range'],
-            'educational_goals': request.form['educational_goals'],
-            'age': request.form['age'],
-            'gender': request.form['gender'],
-            'race_ethnicity': request.form['race_ethnicity'],
-            'working_hours': request.form['working_hours'],
-            'stress_level': request.form['stress_level'],
-            'self_efficacy': request.form['self_efficacy'],
-            'major': request.form['major'],
-            'interests': json.loads(request.form['interests']) if 'interests' in request.form else [],
-            'email': request.form['email']
-        }
+        # Check if request is JSON (API call) or form data (web form)
+        if request.is_json:
+            # Handle JSON API request
+            try:
+                user_data = request.get_json()
+                
+                # Use the user's email as the unique identifier
+                user_email = user_data.get('email')
 
-        # Use the user's email as the unique identifier
-        user_email = user_data.get('email')
+                if not user_email:
+                    return jsonify({'error': 'Email is required to sign up'}), 400
 
-        if not user_email:
-            return "Error: Email is required to sign up.", 400
+                # Save the user data to Firestore
+                try:
+                    db.collection('users').document(user_email).set(user_data)
+                    print(f"User data saved to Firestore: {user_data}")
+                except Exception as e:
+                    return jsonify({'error': f'An error occurred while saving data: {str(e)}'}), 500
 
-        # Save the user data to Firestore
-        try:
-            db.collection('users').document(user_email).set(user_data)
-            print(f"User data saved to Firestore: {user_data}")
-        except Exception as e:
-            return f"An error occurred while saving data: {str(e)}", 500
+                return jsonify({
+                    'message': 'User created successfully',
+                    'email': user_email
+                }), 201
+                
+            except Exception as e:
+                return jsonify({'error': f'An error occurred during signup: {str(e)}'}), 500
+        else:
+            # Handle form data (existing web form logic)
+            user_data = {
+                'name': request.form['name'],
+                'surname': request.form['surname'],
+                'school_name': request.form['school_name'],
+                'year': request.form['year'],
+                'ftcs_status': request.form['ftcs_status'],
+                'gpa_range': request.form['gpa_range'],
+                'educational_goals': request.form['educational_goals'],
+                'age': request.form['age'],
+                'gender': request.form['gender'],
+                'race_ethnicity': request.form['race_ethnicity'],
+                'working_hours': request.form['working_hours'],
+                'stress_level': request.form['stress_level'],
+                'self_efficacy': request.form['self_efficacy'],
+                'major': request.form['major'],
+                'interests': json.loads(request.form['interests']) if 'interests' in request.form else [],
+                'email': request.form['email']
+            }
 
-        # Save the user data in the session
-        session['user_data'] = user_data
-        session['logged_in'] = True
+            # Use the user's email as the unique identifier
+            user_email = user_data.get('email')
 
-        # Redirect to the recommendations page
-        return redirect(url_for('recommendations', email=user_email))
+            if not user_email:
+                return "Error: Email is required to sign up.", 400
+
+            # Save the user data to Firestore
+            try:
+                db.collection('users').document(user_email).set(user_data)
+                print(f"User data saved to Firestore: {user_data}")
+            except Exception as e:
+                return f"An error occurred while saving data: {str(e)}", 500
+
+            # Save the user data in the session
+            session['user_data'] = user_data
+            session['logged_in'] = True
+
+            # Redirect to the recommendations page
+            return redirect(url_for('recommendations', email=user_email))
 
     # Render the signup form
     return render_template('signup.html', majors=majors, options=options)
@@ -379,21 +406,25 @@ def signin():
             # Extract the email
             user_email = data.get('email')
             if not user_email:
-                return "Error: Email is required to sign in.", 400
+                return jsonify({'error': 'Email is required to sign in'}), 400
 
             # Check if user exists in Firestore
             user_doc = db.collection('users').document(user_email).get()
             if user_doc.exists:
+                user_data = user_doc.to_dict()
                 # Save user data to the session
-                session['user_data'] = user_doc.to_dict()
+                session['user_data'] = user_data
                 session['logged_in'] = True
                 print(f"User signed in: {session['user_data']}")
-                return "Sign-in successful.", 200
+                return jsonify({
+                    'message': 'Sign-in successful',
+                    'user': user_data
+                }), 200
             else:
-                return "Error: User not found. Please sign up first.", 404
+                return jsonify({'error': 'User not found. Please sign up first'}), 404
         except Exception as e:
             print("Error during sign-in:", str(e))
-            return f"An error occurred while signing in: {str(e)}", 500
+            return jsonify({'error': f'An error occurred while signing in: {str(e)}'}), 500
 
 @app.route('/verify-token', methods=['POST'])
 def verify_token():
@@ -1005,5 +1036,376 @@ def submit_review():
     # Redirect back to the referring page
     return redirect(request.referrer)
 
+# API helper functions for scoring recommendations
+def score_orgs(df, school_name, year, ftcs_status, gpa_range, major, interests, social_support_rating, intellectual_support_rating, career_development_rating):
+    # Determine user's college based on major
+    user_college = get_college_by_major(major)
+    
+    scores = []
+    explanations = []
+    
+    for _, row in df.iterrows():
+        score = 0
+        explanation_parts = []
+
+        # Parse the "Specific Majors" column from string to list
+        specific_majors = ast.literal_eval(row["Specific Majors"]) if row["Specific Majors"] else []
+
+        # Score based on year and category
+        if year == "1" and row["Category"] in ["Cultural", "Social", "Recreation"]:
+            score += social_support_rating/3
+            explanation_parts.append("This activity is ideal for first-year students to connect socially.")
+        elif year in ["3", "4", "5+"] and row["Category"] in ["Academic Interests", "Educational/Departmental"]:
+            score += 1
+            explanation_parts.append("This activity provides valuable educational and departmental experience for upper-year students.")
+
+        # Score based on interests matching in both Interests and Category columns
+        matched_interests = any(
+            interest in row["Category"] for interest in interests
+        )
+        
+        if matched_interests:
+            score += 1
+            explanation_parts.append("This activity aligns with your interests.")
+        
+        # Score based on college match
+        if row["Majors"] == user_college:
+            score += 2
+            explanation_parts.append("This activity is relevant to your college.")
+        
+        if row["Majors"] == 'any major':
+            score += .5
+            explanation_parts.append("This activity is open to all majors.")
+        
+        # Score based on exact major match
+        if major in specific_majors:
+            score += 3
+            explanation_parts.append("This activity directly aligns with your major.")
+
+        # Append score and explanation for each activity
+        score = round(score, 2)
+        scores.append(score)
+        explanations.append(" ".join(explanation_parts))
+
+    # Add scores and explanations to the DataFrame and sort by Score
+    df["Score"] = scores
+    df["Recommendation Explanation"] = explanations
+    # Sort by the cumulative score in descending order and keep only the top 7 results
+    top_results = df.sort_values(by="Score", ascending=False).head(7)
+
+    return top_results
+
+def score_events_api(df, school_name, year, ftcs_status, gpa_range, major, interests, social_support_rating, intellectual_support_rating, career_development_rating):
+    # Define mappings from school names to categories they influence
+    school_category_mappings = {
+        "School of Arts, Humanities, and Technology": "Social",
+        "Naveen Jindal School of Management": "Business",
+        "Erik Jonsson School of Engineering and Computer Science": "STEM",
+        "School of Natural Sciences and Mathematics": "STEM",
+        "School of Behavioral and Brain Sciences": "STEM",
+        "School of Economic, Political and Policy Sciences": "Business"
+    }
+
+    # Get the school based on the major
+    school = get_college_by_major(major)
+    
+    # Initialize lists for scores and explanations
+    scores = []
+    explanations = []
+
+    for _, row in df.iterrows():
+        # Initialize cumulative score and explanation parts for this row
+        score = 0
+        explanation_parts = []
+
+        # Year-based scoring for Social
+        if year == "1":
+            score += social_support_rating/3
+            explanation_parts.append("Social events can help first-year students build a network and feel more connected to the campus community.")
+
+        # GPA-based scoring for Tutoring
+        if gpa_range == '<2.0' or gpa_range == '2.0 - 2.5':
+            score += intellectual_support_rating/3
+            explanation_parts.append("With a GPA below 2.5, tutoring is highly recommended to support your academic growth.")
+
+        # Year-based scoring for Career Development/Honors
+        if year in ["3", "4", "5"]:
+            score += career_development_rating/3
+            explanation_parts.append("As a 3rd, 4th, or 5th-year student, career development opportunities can help you prepare for post-graduation goals.")
+
+        # School-based scoring
+        if school in school_category_mappings:
+            category = school_category_mappings[school]
+            score += 1
+            explanation_parts.append(f"Being in the {school} makes this opportunity more relevant for {category}.")
+
+        # FTC status scoring for Social
+        if ftcs_status:
+            score += 1
+            explanation_parts.append("As an FTC student, social events can help you integrate and feel more connected to the community.")
+
+        # Append cumulative score and combined explanation
+        score = round(score, 2)
+        scores.append(score)
+        explanations.append(" ".join(explanation_parts))
+
+    # Assign the cumulative scores and explanations to new columns in the DataFrame
+    df["Score"] = scores
+    df["Recommendation Explanation"] = explanations
+    
+    # Sort by the cumulative score in descending order and keep only the top 7 results
+    top_results = df.sort_values(by="Score", ascending=False).head(7)
+
+    return top_results
+
+def score_tutoring_api(df, school_name, year, ftcs_status, gpa_range, major, interests, intellectual_support_rating):
+    scores = []
+    explanations = []
+    
+    for _, row in df.iterrows():
+        score = 0
+        explanation_parts = []
+
+        # Parse "Majors" field if it exists
+        try:
+            majors = row['Majors']
+            majors = majors.split(", ")
+        except (ValueError, SyntaxError):
+            majors = "All Majors"
+        
+        if major not in majors and majors != ['All Majors']:
+            scores.append(0)
+            explanations.append('This opportunity may not be for your major')
+            continue
+
+        # Major-based scoring
+        if major in majors: 
+            score += 1
+            explanation_parts.append("This opportunity is perfect for your major!")
+
+        # Year-based scoring
+        if year == "1":
+            score += 2
+            explanation_parts.append("Tutoring can be a fantastic resource for first-year students adapting to the college workload!")
+        elif year == "2":
+            score += 1
+            explanation_parts.append("Tutoring is highly beneficial for underclassmen building a strong academic foundation.")
+
+        # GPA-based recommendations
+        if gpa_range == '<2.0' or gpa_range == '2.0 - 2.5':
+            score += intellectual_support_rating/3
+            explanation_parts.append("Tutoring can be a valuable tool to help you strengthen your academic performance and reach your goals!")
+        elif gpa_range == '2.6 - 3.0':
+            score += intellectual_support_rating/3
+            explanation_parts.append("With a bit of extra support, you can build on your achievements and keep moving towards your academic potential.")
+        elif gpa_range == '3.1 - 3.5':
+            score += intellectual_support_rating/3
+            explanation_parts.append("Tutoring can be a great way to maintain and even boost your already solid academic standing.")
+
+        # Append score and explanation
+        score = round(score, 2)
+        scores.append(score)
+        explanations.append(" ".join(explanation_parts))
+
+    # Assign scores and explanations to the DataFrame
+    df["Score"] = scores
+    df["Recommendation Explanation"] = explanations
+    return df.sort_values(by="Score", ascending=False)
+
+# Health check endpoint
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'service': 'Campus Connect API'
+    })
+
+# Get available majors
+@app.route('/majors', methods=['GET'])
+def get_majors():
+    return jsonify({'majors': majors})
+
+# Get organization categories
+@app.route('/categories', methods=['GET'])
+def get_categories():
+    return jsonify({'categories': options})
+
+# Get major colors mapping
+@app.route('/major-colors', methods=['GET'])
+def get_major_colors():
+    return jsonify({'major_colors': major_colors})
+
+# Get user profile by email
+@app.route('/profile/<email>', methods=['GET'])
+def get_user_profile(email):
+    try:
+        user_doc = db.collection('users').document(email).get()
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            return jsonify({'user': user_data})
+        else:
+            return jsonify({'error': 'User not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Update user profile by email
+@app.route('/profile/<email>', methods=['PUT'])
+def update_user_profile(email):
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        # Update user data in Firestore
+        db.collection('users').document(email).update(data)
+        return jsonify({'message': 'Profile updated successfully'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Get personalized recommendations
+@app.route('/recommendations', methods=['POST'])
+def get_recommendations():
+    try:
+        data = request.get_json()
+        user_email = data.get('user_email')
+        category = data.get('category')
+        
+        if not user_email or not category:
+            return jsonify({'error': 'user_email and category are required'}), 400
+        
+        # Get user data from Firestore
+        user_doc = db.collection('users').document(user_email).get()
+        if not user_doc.exists:
+            return jsonify({'error': 'User not found'}), 404
+        
+        user_data = user_doc.to_dict()
+        
+        # Extract user variables
+        name = user_data.get('name', 'Unknown')
+        surname = user_data.get('surname', 'Unknown')
+        school_name = user_data.get('school_name', 'Unknown')
+        year = user_data.get('year', '1')
+        ftcs_status = user_data.get('ftcs_status', 'No')
+        gpa_range = user_data.get('gpa_range', '<2.0')
+        major = user_data.get('major', 'Undeclared')
+        interests = user_data.get('interests', [])
+        academic_difficulty = user_data.get('academic_difficulty', 'Moderate')
+        stress_level = user_data.get('stress_level', 'Low')
+        satisfaction = user_data.get('satisfaction', 'Neutral')
+        self_efficacy = user_data.get('self_efficacy', 'Moderate')
+        outside_encouragement = user_data.get('outside_encouragement', [])
+        financial_factors = user_data.get('financial_factors', 'N/A')
+        family_responsibilities = user_data.get('family_responsibilities', 'N/A')
+        
+        def calculate_social_support():
+            score = 0
+            if academic_difficulty == "Difficult" or stress_level == "High":
+                score += 2
+            if "Peers" in outside_encouragement or "Community" in outside_encouragement:
+                score -= 1
+            if satisfaction == "Dissatisfied":
+                score += 2
+            return min(max(score, 1), 5)
+
+        def calculate_intellectual_support():
+            score = 0
+            if gpa_range in ["< 2.0", "2.0 - 2.5"]:
+                score += 3
+            if academic_difficulty == "Difficult":
+                score += 2
+            if self_efficacy == "Little Belief":
+                score += 2
+            if "Teachers" in outside_encouragement:
+                score -= 1
+            return min(max(score, 1), 5)
+
+        def calculate_career_development():
+            score = 0
+            if financial_factors in ["Work Income", "Loan"]:
+                score += 1
+            if satisfaction == "Neutral" or self_efficacy == "Some Belief":
+                score += 1
+            if family_responsibilities == "High":
+                score += 1
+            if "Family" in outside_encouragement:
+                score -= 1
+            return min(max(score, 1), 5)
+        
+        social_support_rating = calculate_social_support()
+        intellectual_support_rating = calculate_intellectual_support()
+        career_development_rating = calculate_career_development()
+        
+        recommendations = []
+        
+        if category == 'orgs':
+            # Use existing organization scoring logic
+            scored_df = score_orgs(orgs_df.copy(), school_name, year, ftcs_status, gpa_range, major, interests, social_support_rating, intellectual_support_rating, career_development_rating)
+            recommendations = scored_df.to_dict(orient='records')
+        elif category == 'events':
+            # Use existing events scoring logic
+            scored_events = score_events_api(events_df.copy(), school_name, year, ftcs_status, gpa_range, major, interests, social_support_rating, intellectual_support_rating, career_development_rating)
+            recommendations = scored_events.to_dict(orient='records')
+            # Format datetime fields
+            for item in recommendations:
+                item['Formatted Start Time'] = format_datetime(item['Start Time'])
+                item['Formatted End Time'] = format_datetime(item['End Time'])
+                item['Event Name'] = extract_event_name(item.get('URL', ''))
+        elif category == 'tutoring':
+            # Use existing tutoring scoring logic
+            scored_tutoring = score_tutoring_api(tutoring_df.copy(), school_name, year, ftcs_status, gpa_range, major, interests, intellectual_support_rating)
+            filtered_tutoring = scored_tutoring[scored_tutoring["Score"] > 0]
+            recommendations = filtered_tutoring.to_dict(orient='records')
+        
+        return jsonify({
+            'recommendations': recommendations,
+            'category': category,
+            'major_colors': major_colors
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Personalized scholarship recommendations
+@app.route('/personalized-scholarships', methods=['POST'])
+def get_personalized_scholarships():
+    try:
+        data = request.get_json()
+        user_email = data.get('user_email')
+        scholarships_data = data.get('scholarships_data', [])
+        
+        if not user_email:
+            return jsonify({'error': 'user_email is required'}), 400
+        
+        # Get user data from Firestore
+        user_doc = db.collection('users').document(user_email).get()
+        if not user_doc.exists:
+            return jsonify({'error': 'User not found'}), 404
+        
+        user_data = user_doc.to_dict()
+        
+        # For now, return mock scholarship recommendations
+        # In a real implementation, you would use AI/ML to generate personalized recommendations
+        mock_recommendations = []
+        
+        for i, scholarship in enumerate(scholarships_data[:5]):  # Limit to top 5
+            mock_recommendations.append({
+                'name': scholarship.get('name', f'Scholarship {i+1}'),
+                'amount': scholarship.get('amount', '$1000'),
+                'deadline': scholarship.get('deadline', '2024-12-31'),
+                'match_score': 85 - (i * 10),  # Decreasing match scores
+                'explanation': f"This scholarship matches your profile based on your major ({user_data.get('major', 'Unknown')}) and interests.",
+                'original_data': scholarship
+            })
+        
+        return jsonify({
+            'recommendations': mock_recommendations,
+            'user_email': user_email,
+            'total_recommendations': len(mock_recommendations)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=8000)
