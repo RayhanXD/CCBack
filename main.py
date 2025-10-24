@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 import pandas as pd
 from urllib.parse import urlparse
 import ast
@@ -77,16 +78,52 @@ except Exception as e:
 
 # Initialize OpenAI client
 try:
+    # Try to get API key from environment variable
     openai_api_key = os.getenv("OPENAI_API_KEY")
+    prompt_template_id = os.getenv("PROMPT_TEMPLATE_ID")
+    
+    # If environment variable doesn't work, try reading directly from .env file
+    if not openai_api_key or openai_api_key == "your-api-key-here":
+        try:
+            with open('.env', 'r') as f:
+                env_content = f.read()
+                for line in env_content.splitlines():
+                    if line.startswith('OPENAI_API_KEY='):
+                        openai_api_key = line.split('=', 1)[1].strip()
+                        print("Using API key from .env file directly")
+                    elif line.startswith('PROMPT_TEMPLATE_ID=') and not prompt_template_id:
+                        prompt_template_id = line.split('=', 1)[1].strip()
+                        print("Using prompt template ID from .env file directly")
+        except Exception as env_error:
+            print(f"Error reading .env file: {env_error}")
+    
     if openai_api_key:
-        client = OpenAI(api_key=openai_api_key)
-        print("OpenAI client initialized successfully")
+        try:
+            # Simple initialization with just the API key
+            client = OpenAI(api_key=openai_api_key)
+            print("OpenAI client initialized successfully")
+            if prompt_template_id:
+                print(f"Prompt template ID loaded: {prompt_template_id}")
+            else:
+                print("Warning: PROMPT_TEMPLATE_ID not found in environment variables")
+        except Exception as e:
+            print(f"OpenAI client initialization error: {e}")
+            # Fallback to basic initialization
+            try:
+                # Import directly to ensure we're using the right version
+                from openai import OpenAI as OpenAIClient
+                client = OpenAIClient(api_key=openai_api_key)
+                print("OpenAI client initialized with fallback method")
+            except Exception as e2:
+                print(f"OpenAI fallback initialization error: {e2}")
+                client = None
     else:
-        print("Warning: OPENAI_API_KEY not found in environment variables")
+        print("Warning: OPENAI_API_KEY not found in environment variables or .env file")
         client = None
 except Exception as e:
     print(f"OpenAI initialization error: {e}")
     client = None
+    prompt_template_id = None
 
 # Pydantic models
 class UserProfile(BaseModel):
@@ -115,6 +152,15 @@ class UserProfile(BaseModel):
     academic_difficulty: Optional[str] = None
     satisfaction: Optional[str] = None
 
+class UniversityModel(BaseModel):
+   name: str
+   short_hand: str
+   website: Optional[str] = None
+   data_files: Optional[List[str]] = None
+   include_majors: Optional[List[str]] = None
+   exclude_majors: Optional[List[str]] = None
+   categorize_by_school: Optional[List[str]] = None
+   
 class UserSignIn(BaseModel):
     email: EmailStr
 
@@ -129,83 +175,81 @@ class ScholarshipRequest(BaseModel):
     user_email: EmailStr
     scholarships_data: List[Dict[str, Any]]
 
-# List of undergraduate majors offered at UTD
-majors = [
-    "Accounting", "Actuarial Science", "American Studies", "Animation and Games",
-    "Applied Cognition and Neuroscience", "Arts, Technology, and Emerging Communication",
-    "Biochemistry", "Biology", "Biomedical Engineering", "Business Administration",
-    "Business Analytics", "Chemistry", "Child Learning and Development", "Cognitive Science",
-    "Computer Engineering", "Computer Science", "Criminology", "Data Science",
-    "Economics", "Electrical Engineering", "Finance", "Geospatial Information Sciences",
-    "Global Business", "Healthcare Management", "History", "Information Technology and Systems",
-    "Interdisciplinary Studies", "International Political Economy", "Literature", "Marketing",
-    "Mathematics", "Mechanical Engineering", "Molecular Biology", "Neuroscience",
-    "Philosophy", "Physics", "Political Science", "Psychology", "Public Affairs",
-    "Public Policy", "Sociology", "Software Engineering", "Speech, Language, and Hearing Sciences",
-    "Supply Chain Management", "Visual and Performing Arts"
-]
+# ChatGPT message models
+class ChatGPTMessage(BaseModel):
+    role: str  # 'user', 'assistant', or 'system'
+    content: str
 
-# UTD majors by school
-utd_majors = {
-    "School of Arts, Humanities, and Technology": [
-        "Literature", "History", "Philosophy", "Art", "Communication", "Media",
-        "Visual Arts", "Music", "Film", "Design", "Creative Writing", "Theater",
-        "Humanities", "Cultural Studies", "Technology in Arts"
-    ],
-    "School of Behavioral and Brain Sciences": [
-        "Psychology", "Neuroscience", "Cognitive Science", "Speech-Language Pathology",
-        "Communication Disorders", "Counseling", "Behavioral Sciences"
-    ],
-    "Erik Jonsson School of Engineering and Computer Science": [
-        "Computer Science", "Computer Engineering", "Electrical Engineering", "Mechanical Engineering",
-        "Software Engineering", "Bioengineering", "Data Science", "Systems Engineering",
-        "Cybersecurity", "Robotics"
-    ],
-    "School of Economic, Political and Policy Sciences": [
-        "Economics", "Political Science", "Public Policy", "Criminology", "Sociology",
-        "Policy Analysis", "Law", "Justice Studies", "Government", "Urban Planning",
-        "International Relations", "Public Administration"
-    ],
-    "School of Interdisciplinary Studies": [
-        "Interdisciplinary Studies", "General Studies", "Individualized Studies"
-    ],
-    "Naveen Jindal School of Management": [
-        "Accounting", "Finance", "Marketing", "Business Administration", "Entrepreneurship",
-        "Management", "Supply Chain Management", "Business Analytics", "Operations Management",
-        "Strategy", "Investment", "Organizational Behavior", "Consulting", "Leadership"
-    ],
-    "School of Natural Sciences and Mathematics": [
-        "Biology", "Chemistry", "Biochemistry", "Mathematics", "Physics", "Geosciences",
-        "Environmental Science", "Ecology", "Genetics", "Cell Biology", "Statistics", "Science Education"
-    ]
-}
+class ChatGPTRequest(BaseModel):
+    user_email: EmailStr
+    messages: List[ChatGPTMessage]
+    model: str = "gpt-4o-mini"
+    temperature: float = 0.7
+    max_tokens: int = 150
+    stream: bool = False
 
-# Major colors mapping
-major_colors = {
-    "Literature": "#f94144", "History": "#f3722c", "Philosophy": "#f8961e", "Art": "#f9844a",
-    "Communication": "#f9c74f", "Media": "#90be6d", "Visual Arts": "#43aa8b", "Music": "#4d908e",
-    "Film": "#577590", "Design": "#277da1", "Creative Writing": "#7209b7", "Theater": "#3a0ca3",
-    "Humanities": "#4361ee", "Cultural Studies": "#4895ef", "Technology in Arts": "#4cc9f0",
-    "Psychology": "#ef476f", "Neuroscience": "#ffd166", "Cognitive Science": "#06d6a0",
-    "Speech-Language Pathology": "#118ab2", "Communication Disorders": "#073b4c",
-    "Counseling": "#ff8c42", "Behavioral Sciences": "#56ab91", "Computer Science": "#f4a261",
-    "Computer Engineering": "#2a9d8f", "Electrical Engineering": "#264653", "Mechanical Engineering": "#e76f51",
-    "Software Engineering": "#ffa69e", "Bioengineering": "#ff6b6b", "Data Science": "#6a0572",
-    "Systems Engineering": "#3c1874", "Cybersecurity": "#5d8233", "Robotics": "#27aeef",
-    "Economics": "#1d3557", "Political Science": "#457b9d", "Public Policy": "#a8dadc",
-    "Criminology": "#e63946", "Sociology": "#f1faee", "Policy Analysis": "#bc6c25",
-    "Law": "#fefae0", "Justice Studies": "#606c38", "Government": "#283618",
-    "Urban Planning": "#dda15e", "International Relations": "#a44a3f", "Public Administration": "#80b918",
-    "Interdisciplinary Studies": "#1f4e5f", "General Studies": "#41b3a3", "Individualized Studies": "#85c7f2",
-    "Accounting": "#ffbe0b", "Finance": "#fb5607", "Marketing": "#ff006e", "Business Administration": "#8338ec",
-    "Entrepreneurship": "#3a86ff", "Management": "#02c39a", "Supply Chain Management": "#00a896",
-    "Business Analytics": "#028090", "Operations Management": "#05668d", "Strategy": "#adc178",
-    "Investment": "#ddbea9", "Organizational Behavior": "#ffe8d6", "Consulting": "#cb997e",
-    "Leadership": "#a5a58d", "Biology": "#ff595e", "Chemistry": "#ffca3a", "Biochemistry": "#8ac926",
-    "Mathematics": "#1982c4", "Physics": "#6a4c93", "Geosciences": "#6d597a", "Environmental Science": "#ffe066",
-    "Ecology": "#dddf00", "Genetics": "#1b998b", "Cell Biology": "#c32f27", "Statistics": "#2d6a4f",
-    "Science Education": "#a9def9"
-}
+class ChatGPTResponse(BaseModel):
+    user_email: EmailStr
+    message: str
+    timestamp: str
+    conversation_id: str
+
+class CalendarRequest(BaseModel):
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    categories: Optional[List[str]] = None
+    location: Optional[str] = None
+# WebSocket connection manager for ChatGPT
+class ChatGPTConnectionManager:
+    def __init__(self):
+        # Dictionary to store active connections by user_email
+        self.active_connections: Dict[str, WebSocket] = {}
+    
+    async def connect(self, websocket: WebSocket, user_email: str):
+        await websocket.accept()
+        self.active_connections[user_email] = websocket
+    
+    def disconnect(self, user_email: str):
+        if user_email in self.active_connections:
+            del self.active_connections[user_email]
+    
+    async def send_message(self, message: str, user_email: str):
+        if user_email in self.active_connections:
+            await self.active_connections[user_email].send_text(message)
+    
+    def is_connected(self, user_email: str) -> bool:
+        return user_email in self.active_connections
+
+# Initialize connection manager
+chatgpt_manager = ChatGPTConnectionManager()
+
+# List of undergraduate majors
+majors_doc = db.collection("majors").document("all_majors").get()
+if majors_doc.exists:
+   majors_data = majors_doc.to_dict()
+   # All Majors
+   majors = majors_data.get("majors", [])
+   # Major Colors Map
+   major_colors = majors_data.get("major_colors", {})
+else:
+   majors = []
+   major_colors = {}
+   print("Majors not found")
+   print(f"# of majors: {len(majors)}")
+   print(f"# of colors: {len(major_colors)}")
+
+
+# Default university shorthand
+user_university = "utd"  # Default to UTD (University of Texas at Dallas)
+
+# categorize majors by school
+cat_majors = db.collection("university").document(user_university).get()
+if cat_majors.exists:
+   cat_majors = cat_majors.to_dict()
+   cat_majors = cat_majors["categorize_by_school"]
+else:
+   cat_majors = []
+   print("Categorize majors by school not found")
 
 # Load data function
 def load_data():
@@ -216,7 +260,8 @@ def load_data():
             "organizations_with_specific_majors.csv", 
             "filtered_utd_events_with_categories.csv",
             "utd_courses.csv",
-            "UTD_tutoring.xlsx"
+            "UTD_tutoring.xlsx",
+            "utd_events.csv"
         ]
         
         missing_files = []
@@ -233,19 +278,59 @@ def load_data():
         orgs_df = pd.read_csv("organizations_with_specific_majors.csv") if os.path.exists("organizations_with_specific_majors.csv") else None
         events_df = pd.read_csv("filtered_utd_events_with_categories.csv") if os.path.exists("filtered_utd_events_with_categories.csv") else None
         courses_df = pd.read_csv("utd_courses.csv") if os.path.exists("utd_courses.csv") else None
+        calendar_df = pd.read_csv("utd_events.csv") if os.path.exists("utd_events.csv") else None
         tutoring_df = pd.read_excel("UTD_tutoring.xlsx", engine="openpyxl") if os.path.exists("UTD_tutoring.xlsx") else None
         
         if activities_df is not None and 'List of Interests' in activities_df.columns:
             activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
         
         print("Data loaded successfully")
-        return activities_df, tutoring_df, orgs_df, events_df, courses_df
+        return activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df
     except Exception as e:
         print(f"Error loading data: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None
+
+#Load University Data
+def university_data():
+    try:
+        # Check if data files exist
+        data_files = [
+            "CC_activities_ex.csv",
+            "organizations_with_specific_majors.csv", 
+            "filtered_utd_events_with_categories.csv",
+            "utd_courses.csv",
+            "utd_events.csv"
+            "UTD_tutoring.xlsx",
+        ]
+        
+        missing_files = []
+        for file in data_files:
+            if not os.path.exists(file):
+                missing_files.append(file)
+        
+        if missing_files:
+            print(f"Warning: Missing data files: {missing_files}")
+            print("Some features may not work properly")
+        
+        # Load available files
+        activities_df = pd.read_csv("CC_activities_ex.csv") if os.path.exists("CC_activities_ex.csv") else None
+        orgs_df = pd.read_csv("organizations_with_specific_majors.csv") if os.path.exists("organizations_with_specific_majors.csv") else None
+        calendar_df = pd.read_csv("utd_events.csv") if os.path.exists("utd_events.csv") else None
+        events_df = pd.read_csv("filtered_utd_events_with_categories.csv") if os.path.exists("filtered_utd_events_with_categories.csv") else None
+        courses_df = pd.read_csv("utd_courses.csv") if os.path.exists("utd_courses.csv") else None
+        tutoring_df = pd.read_excel("UTD_tutoring.xlsx", engine="openpyxl") if os.path.exists("UTD_tutoring.xlsx") else None
+        
+        if activities_df is not None and 'List of Interests' in activities_df.columns:
+            activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
+        
+        print("Data loaded successfully")
+        return activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None, None, None, None, None, None
 
 # Load data at startup
-activities_df, tutoring_df, orgs_df, events_df, courses_df = load_data()
+activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df = load_data()
 
 # Process categories
 if orgs_df is not None:
@@ -257,6 +342,16 @@ if orgs_df is not None:
     options = sorted(set(cleaned_categories))
 else:
     options = []
+
+# Define default UTD majors by college
+utd_majors = {
+    "School of Arts, Humanities, and Technology": ["Arts", "Humanities", "Technology"],
+    "Naveen Jindal School of Management": ["Business", "Management", "Finance", "Accounting"],
+    "Erik Jonsson School of Engineering and Computer Science": ["Computer Science", "Software Engineering", "Computer Engineering", "Electrical Engineering"],
+    "School of Natural Sciences and Mathematics": ["Mathematics", "Physics", "Chemistry", "Biology"],
+    "School of Behavioral and Brain Sciences": ["Psychology", "Neuroscience", "Cognitive Science"],
+    "School of Economic, Political and Policy Sciences": ["Economics", "Political Science", "Public Policy"]
+}
 
 # Utility functions
 def get_college_by_major(major):
@@ -338,6 +433,235 @@ def get_personalized_scholarships(user_data, scholarships_data):
         print(f"Error in getting scholarship recommendations: {e}")
         return []
 
+
+
+async def generate_chatgpt_response(messages, model="gpt-4o-mini", temperature=0.7, max_tokens=150, stream=False):
+    """
+    Generate a response from ChatGPT using the OpenAI API
+    """
+    if not client:
+        fallback_message = "I'm sorry, but the AI service is currently unavailable. Please try again later or contact support."
+        if stream:
+            # For streaming, we need to create a mock stream
+            class MockStream:
+                async def __aiter__(self):
+                    class MockChoice:
+                        class MockDelta:
+                            content = fallback_message
+                        delta = MockDelta()
+                    yield type('MockChunk', (), {'choices': [MockChoice()]})()  
+            return MockStream()
+        else:
+            return fallback_message
+    
+    try:
+        # Convert messages to the format expected by OpenAI API
+        formatted_messages = [
+            {"role": msg.role, "content": msg.content} for msg in messages
+        ]
+        
+        # Add a system message if not present
+        if not any(msg.role == "system" for msg in messages):
+            formatted_messages.insert(0, {
+                "role": "system",
+                "content": "You are a helpful assistant for Campus Connect, a platform that helps college students find resources and connect with their campus community."
+            })
+        
+        # Create the completion request with prompt template if available
+        kwargs = {
+            "model": model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream
+        }
+        
+        # Add prompt template ID if available
+        if 'prompt_template_id' in globals() and prompt_template_id and not stream:
+            kwargs["prompt_template_id"] = prompt_template_id
+        
+        response = client.chat.completions.create(**kwargs)
+        
+        if stream:
+            print(f"Returning stream response of type: {type(response)}")
+            async def stream_generator():
+                print("Starting stream_generator")
+                try:
+                    for chunk in response:
+                        print(f"Got chunk from stream: {chunk}")
+                        yield chunk
+                    print("stream_generator completed")
+                except Exception as stream_error:
+                    print(f"Error in stream_generator: {stream_error}")
+                    # Yield an error chunk
+                    yield {"choices": [{"delta": {"content": f"Error: {str(stream_error)}"}}]}
+            
+            print("Created stream_generator for OpenAI Stream object")
+            return stream_generator()
+        else:
+            # Return the text response
+            return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error generating ChatGPT response: {e}")
+        # Return a fallback message instead of raising an exception
+        if stream:
+            # For streaming, we need to create a mock stream
+            class MockStream:
+                async def __aiter__(self):
+                    class MockChoice:
+                        class MockDelta:
+                            content = f"Error: {str(e)}. Please try again later or contact support."
+                        delta = MockDelta()
+                    yield type('MockChunk', (), {'choices': [MockChoice()]})()
+            return MockStream()
+        else:
+            return f"Error: {str(e)}. Please try again later or contact support."
+
+
+def _extract_content_from_chunk(chunk):
+    """
+    Extract content from a chunk based on its type.
+    Returns None if no content could be extracted or if it's a final chunk.
+    """
+    content = None
+    
+    # Check if this is a final chunk with finish_reason='stop'
+    is_final_chunk = False
+    
+    # Using object attributes (for OpenAI SDK objects)
+    if hasattr(chunk, 'choices') and chunk.choices and len(chunk.choices) > 0:
+        if hasattr(chunk.choices[0], 'finish_reason') and chunk.choices[0].finish_reason == 'stop':
+            is_final_chunk = True
+        elif hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
+            content = chunk.choices[0].delta.content
+    
+    # Dictionary access (for dict-like objects)
+    if content is None and isinstance(chunk, dict) and 'choices' in chunk:
+        if chunk['choices'][0].get('finish_reason') == 'stop':
+            is_final_chunk = True
+        else:
+            content = chunk['choices'][0].get('delta', {}).get('content', '')
+    
+    # Skip final chunks
+    if is_final_chunk:
+        return None
+    
+    #  Direct string conversion (fallback)
+    if content is None and hasattr(chunk, '__str__'):
+        try:
+            chunk_str = str(chunk)
+            if chunk_str and not chunk_str.startswith('<') and not chunk_str.endswith('>'):
+                # Skip ChatCompletionChunk objects
+                if 'ChatCompletionChunk' in chunk_str:
+                    return None
+                content = chunk_str
+        except Exception:
+            pass
+    
+    return content
+
+
+async def _store_conversation(db_instance, user_email, messages, response, conversation_id, model):
+    """Helper function to store conversation in Firestore"""
+    if not db_instance or not response:
+        return
+        
+    try:
+        # Extract the user message
+        user_message = next((msg.content for msg in messages if msg.role == "user"), "")
+        
+        # Create a new document in the user's conversation subcollection
+        user_conversations_ref = db_instance.collection("chatgpt_conversations").document(user_email).collection("conversations")
+        
+        # Add the new conversation
+        user_conversations_ref.add({
+            "user_message": user_message,
+            "assistant_response": response,
+            "timestamp": datetime.now(),
+            "conversation_id": conversation_id,
+            "model": model
+        })
+        
+        # Get the current count of conversations for this user
+        conversations = user_conversations_ref.order_by("timestamp", direction=firestore.Query.ASCENDING).limit(11).stream()
+        
+        # Convert to list to count and access items
+        conversation_list = list(conversations)
+        
+        # If there are more than 10 conversations, delete the oldest one
+        if len(conversation_list) > 10:
+            oldest_conversation = conversation_list[0]
+            user_conversations_ref.document(oldest_conversation.id).delete()
+            print(f"Deleted oldest conversation for user {user_email} to maintain 10 conversation limit")
+            
+    except Exception as e:
+        print(f"Error storing conversation in Firestore: {e}")
+
+
+async def stream_chatgpt_response(websocket: WebSocket, messages, user_email: str, model="gpt-4o-mini", temperature=0.7, max_tokens=150):
+    """
+    Stream a response from ChatGPT to a WebSocket connection
+    """
+    conversation_id = str(datetime.now().timestamp())
+    full_response = ""
+    
+    try:
+        # Get the streaming response
+        stream = await generate_chatgpt_response(messages, model, temperature, max_tokens, stream=True)
+        
+        # Check if stream is valid
+        if stream is None:
+            await websocket.send_text("Error: Invalid stream object received. Please try again later.")
+            return "Error: Invalid stream object", conversation_id
+        
+        # Process the stream
+        try:
+            chunk_count = 0
+            start_time = datetime.now()
+            
+            # Stream each chunk to the WebSocket
+            async for chunk in stream:
+                chunk_count += 1
+                
+                try:
+                    # Extract content from the chunk
+                    content = _extract_content_from_chunk(chunk)
+                    
+                    # If content was extracted, send it to the client
+                    if content:
+                        full_response += content
+                        await websocket.send_text(content)
+                except Exception as chunk_error:
+                    # Log the error but continue processing other chunks
+                    print(f"Error processing chunk: {chunk_error}")
+            
+            # Log completion information
+            duration = (datetime.now() - start_time).total_seconds()
+            print(f"Streaming completed. Processed {chunk_count} chunks in {duration:.2f} seconds")
+            
+        except Exception as stream_error:
+            # Handle streaming errors
+            error_message = "Error while streaming response. Please try again later."
+            await websocket.send_text(error_message)
+            full_response += error_message
+            
+            # Send diagnostic info
+            try:
+                await websocket.send_text(f"\n\nDiagnostic info: {str(stream_error)[:100]}")
+            except Exception:
+                pass
+        
+        # Store conversation in Firestore if available
+        await _store_conversation(db, user_email, messages, full_response, conversation_id, model)
+        
+        return full_response, conversation_id
+        
+    except Exception as e:
+        error_message = f"Error preparing streaming response: {str(e)}"
+        print(error_message)
+        await websocket.send_text(error_message)
+        return error_message, conversation_id
+
 # Dependency to get current user
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -392,7 +716,9 @@ async def signin(user_data: UserSignIn):
     try:
         user_email = user_data.email
         user_doc = db.collection('users').document(user_email).get()
-        
+        # Load University Data of User
+
+
         if user_doc.exists:
             return {"message": "Sign-in successful", "user": user_doc.to_dict()}
         else:
@@ -713,6 +1039,496 @@ async def get_personalized_scholarships_endpoint(request: ScholarshipRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating personalized scholarships: {str(e)}")
+
+#University API
+@app.post("/universities")
+def create_universty(univ: UniversityModel):
+   doc_ref = db.collection("university").document(univ.short_hand.lower())
+   if doc_ref.get().exists:
+       raise HTTPException(status_code=400, detail="University already exists")
+   doc_ref.set(univ.dict())
+   return {"message": "University created successfully"}
+
+
+# Get a unviersity by name
+@app.get("/universities/{short_hand}")
+def get_university(short_hand: str):
+   doc_ref = db.collection("university").document(short_hand.lower())
+   if not doc_ref.get().exists:
+       raise HTTPException(status_code=404, detail="University not found")
+   return doc_ref.get().to_dict()
+
+
+# Update a university
+@app.put("/universities/{short_hand}")
+def update_university(short_hand: str, univ: UniversityModel):
+   doc_ref = db.collection("university").document(short_hand.lower())
+   if not doc_ref.get().exists:
+       raise HTTPException(status_code=404, detail="University not found")
+   doc_ref.update(univ.dict())
+   return {"message": "University updated successfully"}
+
+
+# Delete a university
+@app.delete("/universities/{short_hand}")
+def delete_university(short_hand: str):
+   doc_ref = db.collection("university").document(short_hand.lower())
+   if not doc_ref.get().exists:
+       raise HTTPException(status_code=404, detail="University not found")
+   doc_ref.delete()
+   return {"message": "University deleted successfully"}
+
+
+# List all universities
+@app.get("/universities")
+def list_universities():
+   universities = db.collection("university").get()
+   return [university.to_dict() for university in universities]
+  
+
+# ChatGPT API Endpoints
+
+@app.websocket("/ws/chatgpt/{user_email}")
+async def chatgpt_websocket(websocket: WebSocket, user_email: str):
+    """
+    WebSocket endpoint for streaming ChatGPT responses
+    """
+    try:
+        # Connect to the WebSocket
+        await chatgpt_manager.connect(websocket, user_email)
+        
+        # Process messages
+        while True:
+            # Wait for a message from the client
+            data = await websocket.receive_text()
+            
+            # Parse the message
+            try:
+                message_data = json.loads(data)
+                
+                # Create ChatGPT messages
+                messages = []
+                if "system" in message_data and message_data["system"]:
+                    messages.append(ChatGPTMessage(role="system", content=message_data["system"]))
+                
+                # Add user message
+                if "message" in message_data and message_data["message"]:
+                    messages.append(ChatGPTMessage(role="user", content=message_data["message"]))
+                else:
+                    await websocket.send_text("Error: No message provided")
+                    continue
+                
+                # Get model parameters
+                model = message_data.get("model", "gpt-4o-mini")
+                temperature = message_data.get("temperature", 0.7)
+                max_tokens = message_data.get("max_tokens", 150)
+                
+                # Stream the response
+                await stream_chatgpt_response(
+                    websocket=websocket,
+                    messages=messages,
+                    user_email=user_email,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                
+            except json.JSONDecodeError:
+                await websocket.send_text("Error: Invalid JSON format")
+            except Exception as e:
+                await websocket.send_text(f"Error: {str(e)}")
+    
+    except WebSocketDisconnect:
+        # Handle disconnection
+        chatgpt_manager.disconnect(user_email)
+        print(f"Client disconnected: {user_email}")
+
+@app.post("/chatgpt/chat")
+async def chatgpt_chat(request: ChatGPTRequest):
+    """
+    POST endpoint for ChatGPT responses
+    """
+    try:
+        # Check if OpenAI client is available
+        if not client:
+            raise HTTPException(status_code=500, detail="OpenAI service not available")
+        
+        # Generate response
+        response_text = await generate_chatgpt_response(
+            messages=request.messages,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            stream=False
+        )
+        
+        # Generate a conversation ID
+        conversation_id = str(datetime.now().timestamp())
+        
+        # Store the conversation in Firestore if database is available
+        if db:
+            try:
+                # Get the user message
+                user_message = next((msg.content for msg in request.messages if msg.role == "user"), "")
+                
+                # Create a reference to the user's conversation subcollection
+                user_conversations_ref = db.collection("chatgpt_conversations").document(request.user_email).collection("conversations")
+                
+                # Add the new conversation
+                user_conversations_ref.add({
+                    "user_message": user_message,
+                    "assistant_response": response_text,
+                    "timestamp": datetime.now(),
+                    "conversation_id": conversation_id,
+                    "model": request.model
+                })
+                
+                # Get the current count of conversations for this user
+                conversations = user_conversations_ref.order_by("timestamp", direction=firestore.Query.ASCENDING).limit(11).stream()
+                
+                # Convert to list to count and access items
+                conversation_list = list(conversations)
+                
+                # If there are more than 10 conversations, delete the oldest one
+                if len(conversation_list) > 10:
+                    oldest_conversation = conversation_list[0]
+                    user_conversations_ref.document(oldest_conversation.id).delete()
+                    print(f"Deleted oldest conversation for user {request.user_email} to maintain 10 conversation limit")
+            except Exception as e:
+                print(f"Error storing conversation in Firestore: {e}")
+        
+        # Return the response
+        return {
+            "user_email": request.user_email,
+            "message": response_text,
+            "timestamp": datetime.now().isoformat(),
+            "conversation_id": conversation_id
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
+
+@app.get("/chatgpt/history/{user_email}")
+async def get_chatgpt_history(user_email: str, limit: int = 10):
+    """
+    Get chat history for a specific user
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        # Get reference to the user's conversation subcollection
+        user_conversations_ref = db.collection("chatgpt_conversations").document(user_email).collection("conversations")
+        
+        # Query the subcollection for chat history
+        conversations_ref = user_conversations_ref.order_by(
+            "timestamp", direction=firestore.Query.DESCENDING
+        ).limit(limit)
+        
+        # Get the conversations
+        conversations = conversations_ref.stream()
+        
+        # Convert to list of dictionaries
+        history = []
+        for conv in conversations:
+            conv_data = conv.to_dict()
+            conv_data["id"] = conv.id
+            if "timestamp" in conv_data and isinstance(conv_data["timestamp"], datetime):
+                conv_data["timestamp"] = conv_data["timestamp"].isoformat()
+            history.append(conv_data)
+        
+        return {"history": history, "count": len(history)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving chat history: {str(e)}")
+
+@app.delete("/chatgpt/history/{user_email}/{conversation_id}")
+async def delete_chatgpt_conversation(user_email: str, conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Delete a specific ChatGPT conversation for a user
+    """
+    # Validate that the current user is deleting their own conversation
+    if current_user.get("email") != user_email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own conversations"
+        )
+    
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        # Get reference to the user's conversation subcollection
+        user_conversations_ref = db.collection("chatgpt_conversations").document(user_email).collection("conversations")
+        
+        # Find the conversation with the matching conversation_id
+        query = user_conversations_ref.where("conversation_id", "==", conversation_id).limit(1)
+        conversations = query.stream()
+        
+        # Check if any matching conversation was found
+        conversation_docs = list(conversations)
+        if not conversation_docs:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Delete the conversation document
+        conversation_doc = conversation_docs[0]
+        user_conversations_ref.document(conversation_doc.id).delete()
+        
+        return {"message": "Conversation deleted successfully", "conversation_id": conversation_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting conversation: {str(e)}")
+
+@app.delete("/chatgpt/history/{user_email}")
+async def delete_all_chatgpt_conversations(user_email: str, current_user: dict = Depends(get_current_user)):
+    """
+    Delete all ChatGPT conversations for a user
+    """
+    # Validate that the current user is deleting their own conversations
+    if current_user.get("email") != user_email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own conversations"
+        )
+    
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        # Get reference to the user's conversation subcollection
+        user_conversations_ref = db.collection("chatgpt_conversations").document(user_email).collection("conversations")
+        
+        # Get all conversations for the user
+        conversations = user_conversations_ref.stream()
+        
+        # Delete each conversation document
+        deleted_count = 0
+        for conversation in conversations:
+            user_conversations_ref.document(conversation.id).delete()
+            deleted_count += 1
+        
+        return {"message": "All conversations deleted successfully", "deleted_count": deleted_count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting conversations: {str(e)}")
+
+@app.post("/calendar")
+async def get_calendar_events(request: CalendarRequest = None):
+    """
+    Endpoint to get calendar events from utd_events.csv.
+    
+    Returns events in the format required by the React app:
+    {
+      id: string;
+      title: string;
+      date: string; // ISO date string
+      time: string; // Formatted time string (e.g., "1:00 PM")
+      duration: number; // in minutes
+      location: string;
+      description?: string;
+      color?: string;
+    }
+    """
+    if calendar_df is None:
+        raise HTTPException(status_code=500, detail="Calendar data not available")
+    
+    # Create a copy of the dataframe to avoid modifying the original
+    filtered_events = calendar_df.copy()
+    
+    # Apply filters if provided
+    if request:
+        if request.start_date:
+            try:
+                start_date = datetime.strptime(request.start_date, "%Y-%m-%d")
+                filtered_events = filtered_events[
+                    pd.to_datetime(filtered_events['start_date']).dt.date >= start_date.date()
+                ]
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD")
+        
+        if request.end_date:
+            try:
+                end_date = datetime.strptime(request.end_date, "%Y-%m-%d")
+                filtered_events = filtered_events[
+                    pd.to_datetime(filtered_events['start_date']).dt.date <= end_date.date()
+                ]
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD")
+        
+        if request.categories and len(request.categories) > 0:
+            # Filter events that have at least one of the requested categories
+            filtered_events = filtered_events[
+                filtered_events['categories'].apply(
+                    lambda x: any(cat in str(x).split(',') for cat in request.categories) if pd.notna(x) else False
+                )
+            ]
+        
+        if request.location:
+            # Case-insensitive partial match for location
+            filtered_events = filtered_events[
+                filtered_events['location_name'].str.contains(request.location, case=False, na=False) |
+                filtered_events['location_address'].str.contains(request.location, case=False, na=False)
+            ]
+    
+    # Convert to the required format for the React app
+    events_list = []
+    for _, event in filtered_events.iterrows():
+        # Generate a unique ID
+        event_id = str(hash(event['name'] + str(event['start_date'])))[:8]
+        
+        # Parse start and end dates
+        start_date = pd.to_datetime(event['start_date'])
+        end_date = pd.to_datetime(event['end_date']) if pd.notna(event['end_date']) else start_date
+        
+        # Calculate duration in minutes
+        duration = int((end_date - start_date).total_seconds() / 60)
+        if duration <= 0:
+            duration = 60  # Default to 1 hour if no duration or invalid
+        
+        # Format time as "1:00 PM"
+        time_str = start_date.strftime("%I:%M %p").lstrip("0")
+        
+        # Combine location name and address
+        location = ""
+        if pd.notna(event['location_name']) and event['location_name']:
+            location = event['location_name']
+        if pd.notna(event['location_address']) and event['location_address']:
+            if location:
+                location += ", " + event['location_address']
+            else:
+                location = event['location_address']
+        
+        # Determine color based on category (optional)
+        color = None
+        if pd.notna(event['categories']):
+            categories = str(event['categories']).split(',')
+            if categories:
+                # Simple mapping of categories to colors
+                category_colors = {
+                    "Arts & Performances": "#FF5733",
+                    "Career Development": "#33FF57",
+                    "Academic": "#3357FF",
+                    "Social": "#FF33A8",
+                    "Sports": "#33A8FF",
+                    "Community Service": "#A833FF"
+                }
+                # Use the first category that has a defined color
+                for cat in categories:
+                    if cat.strip() in category_colors:
+                        color = category_colors[cat.strip()]
+                        break
+        
+        # Create event object
+        calendar_event = {
+            "id": event_id,
+            "title": event['name'],
+            "date": start_date.strftime("%Y-%m-%d"),
+            "time": time_str,
+            "duration": duration,
+            "location": location,
+            "description": event['description'] if pd.notna(event['description']) else None,
+            "color": color,
+            "img": event['image'] if pd.notna(event['image']) else None,
+        }
+        
+        events_list.append(calendar_event)
+    
+    return {"events": events_list, "count": len(events_list)}
+@app.get("/today-events")
+async def get_today_events():
+    """
+    Endpoint to get today's events from utd_events.csv.
+    
+    Returns events for today's date in the same format as the calendar endpoint:
+    {
+      id: string;
+      title: string;
+      date: string; // ISO date string
+      time: string; // Formatted time string (e.g., "1:00 PM")
+      duration: number; // in minutes
+      location: string;
+      description?: string;
+      color?: string;
+    }
+    """
+    if calendar_df is None:
+        raise HTTPException(status_code=500, detail="Calendar data not available")
+    
+    # Create a copy of the dataframe to avoid modifying the original
+    filtered_events = calendar_df.copy()
+    
+    # Get today's date
+    today = datetime.now().date()
+    
+    # Filter events for today's date
+    filtered_events = filtered_events[
+        pd.to_datetime(filtered_events['start_date']).dt.date == today
+    ]
+    
+    # Convert to the required format for the React app
+    events_list = []
+    for _, event in filtered_events.iterrows():
+        # Generate a unique ID
+        event_id = str(hash(event['name'] + str(event['start_date'])))[:8]
+        
+        # Parse start and end dates
+        start_date = pd.to_datetime(event['start_date'])
+        end_date = pd.to_datetime(event['end_date']) if pd.notna(event['end_date']) else start_date
+        
+        # Calculate duration in minutes
+        duration = int((end_date - start_date).total_seconds() / 60)
+        if duration <= 0:
+            duration = 60  # Default to 1 hour if no duration or invalid
+        
+        # Format time as "1:00 PM"
+        time_str = start_date.strftime("%I:%M %p").lstrip("0")
+        
+        # Combine location name and address
+        location = ""
+        if pd.notna(event['location_name']) and event['location_name']:
+            location = event['location_name']
+        if pd.notna(event['location_address']) and event['location_address']:
+            if location:
+                location += ", " + event['location_address']
+            else:
+                location = event['location_address']
+        
+        # Determine color based on category (optional)
+        color = None
+        if pd.notna(event['categories']):
+            categories = str(event['categories']).split(',')
+            if categories:
+                # Simple mapping of categories to colors
+                category_colors = {
+                    "Arts & Performances": "#FF5733",
+                    "Career Development": "#33FF57",
+                    "Academic": "#3357FF",
+                    "Social": "#FF33A8",
+                    "Sports": "#33A8FF",
+                    "Community Service": "#A833FF"
+                }
+                # Use the first category that has a defined color
+                for cat in categories:
+                    if cat.strip() in category_colors:
+                        color = category_colors[cat.strip()]
+                        break
+        
+        # Create event object
+        calendar_event = {
+            "id": event_id,
+            "title": event['name'],
+            "date": start_date.strftime("%Y-%m-%d"),
+            "time": time_str,
+            "duration": duration,
+            "location": location,
+            "description": event['description'] if pd.notna(event['description']) else None,
+            "color": color,
+            "img": event['image'] if pd.notna(event['image']) else None,
+        }
+        
+        events_list.append(calendar_event)
+    
+    return {"events": events_list, "count": len(events_list)}
+
 
 if __name__ == "__main__":
     import uvicorn
