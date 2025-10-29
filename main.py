@@ -14,6 +14,9 @@ from pydantic import BaseModel, EmailStr
 from typing import List, Optional, Dict, Any
 import os
 from openai import OpenAI
+import requests
+import io
+import tempfile
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -50,8 +53,12 @@ security = HTTPBearer()
 # Initialize Firebase Admin SDK
 try:
     # Check if running in Railway (production)
-    if os.getenv("RAILWAY_ENVIRONMENT"):
+    railway_env = os.getenv("RAILWAY_ENVIRONMENT")
+    print(f"RAILWAY_ENVIRONMENT: {railway_env}")
+    
+    if railway_env:
         # Use environment variables for Railway
+        print("Using environment variables for Firebase initialization")
         firebase_config = {
             "type": "service_account",
             "project_id": os.getenv("FIREBASE_PROJECT_ID"),
@@ -67,6 +74,11 @@ try:
         cred = credentials.Certificate(firebase_config)
     else:
         # Use local file for development
+        print("Using local firebase-key.json file for Firebase initialization")
+        if os.path.exists("firebase-key.json"):
+            print("firebase-key.json exists")
+        else:
+            print("firebase-key.json does not exist!")
         cred = credentials.Certificate("firebase-key.json")
     
     firebase_admin.initialize_app(cred)
@@ -74,9 +86,12 @@ try:
     print("Firebase initialized successfully")
 except Exception as e:
     print(f"Firebase initialization error: {e}")
+    import traceback
+    traceback.print_exc()
     db = None
 
 # Initialize OpenAI client
+client = None
 try:
     # Try to get API key from environment variable
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -99,7 +114,7 @@ try:
     
     if openai_api_key:
         try:
-            # Simple initialization with just the API key
+            # Simple initialization with just the API key - no proxies
             client = OpenAI(api_key=openai_api_key)
             print("OpenAI client initialized successfully")
             if prompt_template_id:
@@ -121,7 +136,7 @@ try:
         print("Warning: OPENAI_API_KEY not found in environment variables or .env file")
         client = None
 except Exception as e:
-    print(f"OpenAI initialization error: {e}")
+    print(f"Error in OpenAI initialization: {e}")
     client = None
     prompt_template_id = None
 
@@ -224,67 +239,174 @@ class ChatGPTConnectionManager:
 chatgpt_manager = ChatGPTConnectionManager()
 
 # List of undergraduate majors
-majors_doc = db.collection("majors").document("all_majors").get()
-if majors_doc.exists:
-   majors_data = majors_doc.to_dict()
-   # All Majors
-   majors = majors_data.get("majors", [])
-   # Major Colors Map
-   major_colors = majors_data.get("major_colors", {})
+majors = []
+major_colors = {}
+
+# Only try to access Firestore if db is not None
+if db is not None:
+    try:
+        majors_doc = db.collection("majors").document("all_majors").get()
+        if majors_doc.exists:
+            majors_data = majors_doc.to_dict()
+            # All Majors
+            majors = majors_data.get("majors", [])
+            # Major Colors Map
+            major_colors = majors_data.get("major_colors", {})
+        else:
+            print("Majors not found")
+            print(f"# of majors: {len(majors)}")
+            print(f"# of colors: {len(major_colors)}")
+    except Exception as e:
+        print(f"Error accessing majors collection: {e}")
 else:
-   majors = []
-   major_colors = {}
-   print("Majors not found")
-   print(f"# of majors: {len(majors)}")
-   print(f"# of colors: {len(major_colors)}")
+    print("Database not initialized, using empty majors list")
+    print(f"# of majors: {len(majors)}")
+    print(f"# of colors: {len(major_colors)}")
 
 
 # Default university shorthand
 user_university = "utd"  # Default to UTD (University of Texas at Dallas)
 
 # categorize majors by school
-cat_majors = db.collection("university").document(user_university).get()
-if cat_majors.exists:
-   cat_majors = cat_majors.to_dict()
-   cat_majors = cat_majors["categorize_by_school"]
+cat_majors = {}
+
+# Only try to access Firestore if db is not None
+if db is not None:
+    try:
+        cat_majors_doc = db.collection("university").document(user_university).get()
+        if cat_majors_doc.exists:
+            cat_majors_data = cat_majors_doc.to_dict()
+            cat_majors = cat_majors_data.get("categorize_by_school", {})
+        else:
+            print("University categorization not found")
+    except Exception as e:
+        print(f"Error accessing university collection: {e}")
 else:
-   cat_majors = []
-   print("Categorize majors by school not found")
+    print("Database not initialized, using empty categorization")
 
 # Load data function
 def load_data():
     try:
-        # Check if data files exist
-        data_files = [
-            "CC_activities_ex.csv",
-            "organizations_with_specific_majors.csv", 
-            "filtered_utd_events_with_categories.csv",
-            "utd_courses.csv",
-            "UTD_tutoring.xlsx",
-            "utd_events.csv"
-        ]
+        # Get university data from Firestore
+        if not db:
+            print("Database not initialized, cannot load data")
+            return None, None, None, None, None, None
         
-        missing_files = []
-        for file in data_files:
-            if not os.path.exists(file):
-                missing_files.append(file)
+        # Get the university document for the current university
+        university_doc = db.collection("university").document('utd').get()
         
-        if missing_files:
-            print(f"Warning: Missing data files: {missing_files}")
-            print("Some features may not work properly")
+        if not university_doc.exists:
+            print(f"University document for {user_university} not found")
+            return None, None, None, None, None, None
         
-        # Load available files
-        activities_df = pd.read_csv("CC_activities_ex.csv") if os.path.exists("CC_activities_ex.csv") else None
-        orgs_df = pd.read_csv("organizations_with_specific_majors.csv") if os.path.exists("organizations_with_specific_majors.csv") else None
-        events_df = pd.read_csv("filtered_utd_events_with_categories.csv") if os.path.exists("filtered_utd_events_with_categories.csv") else None
-        courses_df = pd.read_csv("utd_courses.csv") if os.path.exists("utd_courses.csv") else None
-        calendar_df = pd.read_csv("utd_events.csv") if os.path.exists("utd_events.csv") else None
-        tutoring_df = pd.read_excel("UTD_tutoring.xlsx", engine="openpyxl") if os.path.exists("UTD_tutoring.xlsx") else None
+        university_data = university_doc.to_dict()
+        data_file_urls = university_data.get("data_files", {})
         
-        if activities_df is not None and 'List of Interests' in activities_df.columns:
-            activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
+        if not data_file_urls:
+            print("No data file URLs found in university document")
+            return None, None, None, None, None, None
         
-        print("Data loaded successfully")
+        print(f"Found data file URLs in university collection")
+        
+        # Initialize dataframes
+        activities_df = None
+        orgs_df = None
+        events_df = None
+        courses_df = None
+        calendar_df = None
+        tutoring_df = None
+        
+        # Load activities_df from URL
+        if "activities_df" in data_file_urls:
+            try:
+                url = data_file_urls["activities_df"]
+                response = requests.get(url)
+                if response.status_code == 200:
+                    activities_df = pd.read_csv(io.StringIO(response.text))
+                    if 'List of Interests' in activities_df.columns:
+                        activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
+                    print("Activities data loaded successfully")
+                else:
+                    print(f"Failed to download activities data: {response.status_code}")
+            except Exception as e:
+                print(f"Error loading activities data: {e}")
+        
+        # Load orgs_df from URL
+        if "orgs_df" in data_file_urls:
+            try:
+                url = data_file_urls["orgs_df"]
+                response = requests.get(url)
+                if response.status_code == 200:
+                    orgs_df = pd.read_csv(io.StringIO(response.text))
+                    print("Organizations data loaded successfully")
+                else:
+                    print(f"Failed to download organizations data: {response.status_code}")
+            except Exception as e:
+                print(f"Error loading organizations data: {e}")
+        
+        # Load events_df from URL
+        if "events_df" in data_file_urls:
+            try:
+                url = data_file_urls["events_df"]
+                response = requests.get(url)
+                if response.status_code == 200:
+                    events_df = pd.read_csv(io.StringIO(response.text))
+                    print("Events data loaded successfully")
+                else:
+                    print(f"Failed to download events data: {response.status_code}")
+            except Exception as e:
+                print(f"Error loading events data: {e}")
+        
+        # Load courses_df from URL
+        if "courses_df" in data_file_urls:
+            try:
+                url = data_file_urls["courses_df"]
+                response = requests.get(url)
+                if response.status_code == 200:
+                    courses_df = pd.read_csv(io.StringIO(response.text))
+                    print("Courses data loaded successfully")
+                else:
+                    print(f"Failed to download courses data: {response.status_code}")
+            except Exception as e:
+                print(f"Error loading courses data: {e}")
+        
+        # Load calendar_df from URL
+        if "calendar_df" in data_file_urls:
+            try:
+                url = data_file_urls["calendar_df"]
+                response = requests.get(url)
+                if response.status_code == 200:
+                    calendar_df = pd.read_csv(io.StringIO(response.text))
+                    print("Calendar data loaded successfully")
+                else:
+                    print(f"Failed to download calendar data: {response.status_code}")
+            except Exception as e:
+                print(f"Error loading calendar data: {e}")
+        
+        # Load tutoring_df from URL (special case for Excel file)
+        if "tutoring_df" in data_file_urls:
+            try:
+                url = data_file_urls["tutoring_df"]
+                response = requests.get(url)
+                if response.status_code == 200:
+                    # Save the Excel file to a temporary file
+                    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as temp_file:
+                        temp_file.write(response.content)
+                        temp_path = temp_file.name
+                    
+                    # Read the Excel file from the temporary file
+                    tutoring_df = pd.read_excel(temp_path, engine="openpyxl")
+                    
+                    # Remove the temporary file
+                    os.unlink(temp_path)
+                    
+                    print("Tutoring data loaded successfully")
+                else:
+                    print(f"Failed to download tutoring data: {response.status_code}")
+            except Exception as e:
+                print(f"Error loading tutoring data: {e}")
+        
+        print("All available data loaded successfully")
         return activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df
     except Exception as e:
         print(f"Error loading data: {e}")
@@ -292,42 +414,8 @@ def load_data():
 
 #Load University Data
 def university_data():
-    try:
-        # Check if data files exist
-        data_files = [
-            "CC_activities_ex.csv",
-            "organizations_with_specific_majors.csv", 
-            "filtered_utd_events_with_categories.csv",
-            "utd_courses.csv",
-            "utd_events.csv"
-            "UTD_tutoring.xlsx",
-        ]
-        
-        missing_files = []
-        for file in data_files:
-            if not os.path.exists(file):
-                missing_files.append(file)
-        
-        if missing_files:
-            print(f"Warning: Missing data files: {missing_files}")
-            print("Some features may not work properly")
-        
-        # Load available files
-        activities_df = pd.read_csv("CC_activities_ex.csv") if os.path.exists("CC_activities_ex.csv") else None
-        orgs_df = pd.read_csv("organizations_with_specific_majors.csv") if os.path.exists("organizations_with_specific_majors.csv") else None
-        calendar_df = pd.read_csv("utd_events.csv") if os.path.exists("utd_events.csv") else None
-        events_df = pd.read_csv("filtered_utd_events_with_categories.csv") if os.path.exists("filtered_utd_events_with_categories.csv") else None
-        courses_df = pd.read_csv("utd_courses.csv") if os.path.exists("utd_courses.csv") else None
-        tutoring_df = pd.read_excel("UTD_tutoring.xlsx", engine="openpyxl") if os.path.exists("UTD_tutoring.xlsx") else None
-        
-        if activities_df is not None and 'List of Interests' in activities_df.columns:
-            activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
-        
-        print("Data loaded successfully")
-        return activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        return None, None, None, None, None, None
+    # Just call the load_data function to maintain consistency
+    return load_data()
 
 # Load data at startup
 activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df = load_data()
