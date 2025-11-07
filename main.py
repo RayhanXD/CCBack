@@ -6,6 +6,7 @@ import pandas as pd
 from urllib.parse import urlparse
 import ast
 import json
+import math
 import re
 from datetime import datetime
 import firebase_admin
@@ -17,6 +18,9 @@ from openai import OpenAI
 import requests
 import io
 import tempfile
+import signal
+import asyncio
+from contextlib import contextmanager
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -24,6 +28,10 @@ app = FastAPI(
     description="Backend API for Campus Connect application",
     version="1.0.0"
 )
+
+# Initialize global variables
+db = None
+calendar_df = None
 
 # CORS middleware
 allowed_origins = [
@@ -50,50 +58,149 @@ app.add_middleware(
 # Security
 security = HTTPBearer()
 
-# Initialize Firebase Admin SDK
-try:
-    # Check if running in Railway (production)
-    railway_env = os.getenv("RAILWAY_ENVIRONMENT")
-    print(f"RAILWAY_ENVIRONMENT: {railway_env}")
-    
-    if railway_env:
-        # Use environment variables for Railway
-        print("Using environment variables for Firebase initialization")
-        firebase_config = {
-            "type": "service_account",
-            "project_id": os.getenv("FIREBASE_PROJECT_ID"),
-            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-            "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace('\\n', '\n'),
-            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
-            "client_id": os.getenv("FIREBASE_CLIENT_ID"),
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_X509_CERT_URL")
-        }
-        cred = credentials.Certificate(firebase_config)
-    else:
-        # Use local file for development
-        print("Using local firebase-key.json file for Firebase initialization")
-        if os.path.exists("firebase-key.json"):
-            print("firebase-key.json exists")
-        else:
-            print("firebase-key.json does not exist!")
-        cred = credentials.Certificate("firebase-key.json")
-    
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("Firebase initialized successfully")
-except Exception as e:
-    print(f"Firebase initialization error: {e}")
-    import traceback
-    traceback.print_exc()
-    db = None
+class TimeoutException(Exception):
+    pass
 
+@contextmanager
+def timeout(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutException(f"Timed out after {seconds} seconds")
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+
+# Initialize Firebase Admin SDK
+print("Setting up Firebase...")
+db = None
+
+def initialize_firebase():
+    """Initialize Firebase with retry logic"""
+    global db
+    
+    if db is not None:
+        return db
+    
+    # Try to initialize with firebase-key.json first
+    key_file = "/app/firebase-key.json"
+    if os.path.exists(key_file):
+        print(f" Found Firebase key file at {key_file}")
+        try:
+            cred = credentials.Certificate(key_file)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            print(" Firebase initialized successfully from JSON file")
+            return db
+        except Exception as e:
+            print(f" Failed to initialize Firebase from JSON file: {str(e)}")
+    else:
+        print(f" Firebase key file not found at {key_file}")
+    
+    # Fallback to environment variables
+    print(" Checking for Firebase environment variables...")
+    project_id = os.getenv("FIREBASE_PROJECT_ID")
+    private_key = os.getenv("FIREBASE_PRIVATE_KEY")
+    client_email = os.getenv("FIREBASE_CLIENT_EMAIL")
+    
+    if project_id and private_key and client_email:
+        print("Found Firebase environment variables")
+        try:
+            firebase_config = {
+                "type": "service_account",
+                "project_id": project_id,
+                "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
+                "private_key": private_key.replace('\\n', '\n'),
+                "client_email": client_email,
+                "client_id": os.getenv("FIREBASE_CLIENT_ID"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_X509_CERT_URL")
+            }
+            
+            cred = credentials.Certificate(firebase_config)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            print(" Firebase initialized successfully from environment variables")
+            return db
+        except Exception as e:
+            print(f" Failed to initialize Firebase from environment variables: {str(e)}")
+            print("Please check your Firebase configuration and credentials.")
+    else:
+        print(" Missing required Firebase environment variables")
+        print("Please set FIREBASE_PROJECT_ID, FIREBASE_PRIVATE_KEY, and FIREBASE_CLIENT_EMAIL environment variables.")
+    
+    # If we get here, all initialization attempts failed
+    raise RuntimeError("Failed to initialize Firebase. Please check your configuration and try again.")
+
+def get_db():
+    """Helper function to get database connection with lazy initialization"""
+    global db
+    if db is not None:
+        return db
+        
+    try:
+        db = initialize_firebase()
+        if db is None:
+            raise RuntimeError("Failed to initialize Firebase: initialize_firebase() returned None")
+        return db
+    except Exception as e:
+        error_msg = f"Failed to initialize Firebase: {str(e)}"
+        print(error_msg)
+        # Don't raise the exception here, let the calling function handle it
+        return None
+
+# ------------------------------
 # Initialize OpenAI client
-client = None
+# ------------------------------
+
+# Create a custom OpenAI client class that handles the proxies issue
+class CustomOpenAI:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.chat = self.Chat(api_key)
+    
+    class Chat:
+        def __init__(self, api_key):
+            self.api_key = api_key
+            self.completions = self.Completions(api_key)
+        
+        class Completions:
+            def __init__(self, api_key):
+                self.api_key = api_key
+            
+            def create(self, **kwargs):
+                # Import here to avoid circular imports
+                import httpx
+                from openai import OpenAI
+                
+                # Create a custom HTTP client without proxies
+                http_client = httpx.Client()
+                
+                # Create a real OpenAI client with the custom HTTP client
+                try:
+                    real_client = OpenAI(
+                        api_key=self.api_key,
+                        http_client=http_client
+                    )
+                    
+                    # Forward the call to the real client
+                    return real_client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    print(f"Error in OpenAI API call: {e}")
+                    # Create a mock response for error cases
+                    class MockResponse:
+                        class Choice:
+                            class Message:
+                                content = f"Error: {str(e)}"
+                            message = Message()
+                        choices = [Choice()]
+                    return MockResponse()
+
 try:
-    # Try to get API key from environment variable
+    # Get API key from environment
     openai_api_key = os.getenv("OPENAI_API_KEY")
     prompt_template_id = os.getenv("PROMPT_TEMPLATE_ID")
     
@@ -112,31 +219,21 @@ try:
         except Exception as env_error:
             print(f"Error reading .env file: {env_error}")
     
+    # Initialize custom OpenAI client
     if openai_api_key:
-        try:
-            # Simple initialization with just the API key - no proxies
-            client = OpenAI(api_key=openai_api_key)
-            print("OpenAI client initialized successfully")
-            if prompt_template_id:
-                print(f"Prompt template ID loaded: {prompt_template_id}")
-            else:
-                print("Warning: PROMPT_TEMPLATE_ID not found in environment variables")
-        except Exception as e:
-            print(f"OpenAI client initialization error: {e}")
-            # Fallback to basic initialization
-            try:
-                # Import directly to ensure we're using the right version
-                from openai import OpenAI as OpenAIClient
-                client = OpenAIClient(api_key=openai_api_key)
-                print("OpenAI client initialized with fallback method")
-            except Exception as e2:
-                print(f"OpenAI fallback initialization error: {e2}")
-                client = None
+        client = CustomOpenAI(api_key=openai_api_key)
+        print("Custom OpenAI client initialized successfully")
+        
+        if prompt_template_id:
+            print(f"Prompt template ID loaded: {prompt_template_id}")
+        else:
+            print("Warning: PROMPT_TEMPLATE_ID not found in environment variables")
     else:
         print("Warning: OPENAI_API_KEY not found in environment variables or .env file")
         client = None
+        
 except Exception as e:
-    print(f"Error in OpenAI initialization: {e}")
+    print(f"Error in OpenAI initialization: {str(e)}")
     client = None
     prompt_template_id = None
 
@@ -190,14 +287,22 @@ class ScholarshipRequest(BaseModel):
     user_email: EmailStr
     scholarships_data: List[Dict[str, Any]]
 
-# ChatGPT message models
-class ChatGPTMessage(BaseModel):
-    role: str  # 'user', 'assistant', or 'system'
+# ------------------------------
+# Message Models
+# ------------------------------
+class ChatGPTMessage:
+    def __init__(self, role: str, content: str):
+        self.role = role
+        self.content = content
+
+# Define a Pydantic model for ChatGPT messages
+class ChatGPTMessageModel(BaseModel):
+    role: str
     content: str
 
 class ChatGPTRequest(BaseModel):
     user_email: EmailStr
-    messages: List[ChatGPTMessage]
+    messages: List[ChatGPTMessageModel]
     model: str = "gpt-4o-mini"
     temperature: float = 0.7
     max_tokens: int = 150
@@ -214,26 +319,27 @@ class CalendarRequest(BaseModel):
     end_date: Optional[str] = None
     categories: Optional[List[str]] = None
     location: Optional[str] = None
-# WebSocket connection manager for ChatGPT
+# ------------------------------
+# Simple Connection Manager
+# ------------------------------
 class ChatGPTConnectionManager:
     def __init__(self):
-        # Dictionary to store active connections by user_email
         self.active_connections: Dict[str, WebSocket] = {}
-    
+
     async def connect(self, websocket: WebSocket, user_email: str):
         await websocket.accept()
         self.active_connections[user_email] = websocket
-    
+        print(f"🔌 Connected: {user_email}")
+
     def disconnect(self, user_email: str):
         if user_email in self.active_connections:
             del self.active_connections[user_email]
-    
-    async def send_message(self, message: str, user_email: str):
-        if user_email in self.active_connections:
-            await self.active_connections[user_email].send_text(message)
-    
-    def is_connected(self, user_email: str) -> bool:
-        return user_email in self.active_connections
+            print(f" Disconnected: {user_email}")
+
+    async def send_personal_message(self, message: str, user_email: str):
+        websocket = self.active_connections.get(user_email)
+        if websocket:
+            await websocket.send_text(message)
 
 # Initialize connection manager
 chatgpt_manager = ChatGPTConnectionManager()
@@ -283,9 +389,11 @@ if db is not None:
         print(f"Error accessing university collection: {e}")
 else:
     print("Database not initialized, using empty categorization")
-
+""" (commented out file system)
 # Load data function
 def load_data():
+    global calendar_df
+    
     try:
         # Get university data from Firestore
         if not db:
@@ -301,6 +409,8 @@ def load_data():
         
         university_data = university_doc.to_dict()
         data_file_urls = university_data.get("data_files", {})
+
+        print(data_file_urls)
         
         if not data_file_urls:
             print("No data file URLs found in university document")
@@ -383,6 +493,17 @@ def load_data():
             except Exception as e:
                 print(f"Error loading calendar data: {e}")
         
+        # Fallback to local file if calendar_df is still None
+        if calendar_df is None:
+            try:
+                if os.path.exists("utd_events.csv"):
+                    calendar_df = pd.read_csv("utd_events.csv")
+                    print("Calendar data loaded from local file")
+                else:
+                    print("Local calendar data file not found")
+            except Exception as e:
+                print(f"Error loading local calendar data: {e}")
+        
         # Load tutoring_df from URL (special case for Excel file)
         if "tutoring_df" in data_file_urls:
             try:
@@ -416,6 +537,47 @@ def load_data():
 def university_data():
     # Just call the load_data function to maintain consistency
     return load_data()
+"""
+
+def load_data():
+    global calendar_df
+    
+    try:
+        # Check if data files exist
+        data_files = [
+            "CC_activities_ex.csv",
+            "organizations_with_specific_majors.csv", 
+            "filtered_utd_events_with_categories.csv",
+            "utd_courses.csv",
+            "UTD_tutoring.xlsx",
+            "utd_events.csv"
+        ]
+        
+        missing_files = []
+        for file in data_files:
+            if not os.path.exists(file):
+                missing_files.append(file)
+        
+        if missing_files:
+            print(f"Warning: Missing data files: {missing_files}")
+            print("Some features may not work properly")
+        
+        # Load available files
+        activities_df = pd.read_csv("CC_activities_ex.csv") if os.path.exists("CC_activities_ex.csv") else None
+        orgs_df = pd.read_csv("organizations_with_specific_majors.csv") if os.path.exists("organizations_with_specific_majors.csv") else None
+        events_df = pd.read_csv("filtered_utd_events_with_categories.csv") if os.path.exists("filtered_utd_events_with_categories.csv") else None
+        courses_df = pd.read_csv("utd_courses.csv") if os.path.exists("utd_courses.csv") else None
+        tutoring_df = pd.read_excel("UTD_tutoring.xlsx", engine="openpyxl") if os.path.exists("UTD_tutoring.xlsx") else None
+        calendar_df = pd.read_csv("utd_events.csv") if os.path.exists("utd_events.csv") else None
+        
+        if activities_df is not None and 'List of Interests' in activities_df.columns:
+            activities_df['List of Interests'] = activities_df['List of Interests'].apply(ast.literal_eval)
+        
+        print("Data loaded successfully")
+        return activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None, None, None, None, None, None
 
 # Load data at startup
 activities_df, tutoring_df, orgs_df, events_df, courses_df, calendar_df = load_data()
@@ -528,19 +690,10 @@ async def generate_chatgpt_response(messages, model="gpt-4o-mini", temperature=0
     Generate a response from ChatGPT using the OpenAI API
     """
     if not client:
-        fallback_message = "I'm sorry, but the AI service is currently unavailable. Please try again later or contact support."
-        if stream:
-            # For streaming, we need to create a mock stream
-            class MockStream:
-                async def __aiter__(self):
-                    class MockChoice:
-                        class MockDelta:
-                            content = fallback_message
-                        delta = MockDelta()
-                    yield type('MockChunk', (), {'choices': [MockChoice()]})()  
-            return MockStream()
-        else:
-            return fallback_message
+        # If OpenAI client is not initialized, raise an exception
+        # This will be caught by the calling function and returned as a 500 error
+        raise Exception("OpenAI client is not initialized. Please check your API key configuration.")
+        # We're not using a fallback message or mock client anymore as requested
     
     try:
         # Convert messages to the format expected by OpenAI API
@@ -686,70 +839,6 @@ async def _store_conversation(db_instance, user_email, messages, response, conve
         print(f"Error storing conversation in Firestore: {e}")
 
 
-async def stream_chatgpt_response(websocket: WebSocket, messages, user_email: str, model="gpt-4o-mini", temperature=0.7, max_tokens=150):
-    """
-    Stream a response from ChatGPT to a WebSocket connection
-    """
-    conversation_id = str(datetime.now().timestamp())
-    full_response = ""
-    
-    try:
-        # Get the streaming response
-        stream = await generate_chatgpt_response(messages, model, temperature, max_tokens, stream=True)
-        
-        # Check if stream is valid
-        if stream is None:
-            await websocket.send_text("Error: Invalid stream object received. Please try again later.")
-            return "Error: Invalid stream object", conversation_id
-        
-        # Process the stream
-        try:
-            chunk_count = 0
-            start_time = datetime.now()
-            
-            # Stream each chunk to the WebSocket
-            async for chunk in stream:
-                chunk_count += 1
-                
-                try:
-                    # Extract content from the chunk
-                    content = _extract_content_from_chunk(chunk)
-                    
-                    # If content was extracted, send it to the client
-                    if content:
-                        full_response += content
-                        await websocket.send_text(content)
-                except Exception as chunk_error:
-                    # Log the error but continue processing other chunks
-                    print(f"Error processing chunk: {chunk_error}")
-            
-            # Log completion information
-            duration = (datetime.now() - start_time).total_seconds()
-            print(f"Streaming completed. Processed {chunk_count} chunks in {duration:.2f} seconds")
-            
-        except Exception as stream_error:
-            # Handle streaming errors
-            error_message = "Error while streaming response. Please try again later."
-            await websocket.send_text(error_message)
-            full_response += error_message
-            
-            # Send diagnostic info
-            try:
-                await websocket.send_text(f"\n\nDiagnostic info: {str(stream_error)[:100]}")
-            except Exception:
-                pass
-        
-        # Store conversation in Firestore if available
-        await _store_conversation(db, user_email, messages, full_response, conversation_id, model)
-        
-        return full_response, conversation_id
-        
-    except Exception as e:
-        error_message = f"Error preparing streaming response: {str(e)}"
-        print(error_message)
-        await websocket.send_text(error_message)
-        return error_message, conversation_id
-
 # Dependency to get current user
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -772,7 +861,55 @@ async def health_check():
 
 @app.get("/majors")
 async def get_majors():
-    return {"majors": majors}
+    try:
+        print("=== MAJORS ENDPOINT CALLED ===")
+        database = get_db()
+        print(f"Database object: {database}")
+        
+        if not database:
+            print("❌ Database not available")
+            return {"majors": [], "error": "Database not available"}
+        
+        print("✅ Database available, querying majors...")
+        majors_doc = database.collection("majors").document("all_majors").get()
+        print(f"Document exists: {majors_doc.exists}")
+        
+        if majors_doc.exists:
+            majors_data = majors_doc.to_dict()
+            majors_list = majors_data.get("majors", [])
+            print(f"✅ Found {len(majors_list)} majors")
+            return {"majors": majors_list}
+        else:
+            print("❌ Majors document not found")
+            return {"majors": [], "error": "Document not found"}
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return {"majors": [], "error": str(e)}
+
+@app.get("/debug-firebase")
+async def debug_firebase():
+    """Debug Firebase connection and document access"""
+    try:
+        database = get_db()
+        if not database:
+            return {"status": "error", "message": "Database not available"}
+        
+        # Test collections access
+        collections = list(database.collections())
+        collection_names = [col.id for col in collections]
+        
+        # Test majors document specifically
+        majors_doc = database.collection("majors").document("all_majors").get()
+        
+        return {
+            "status": "success",
+            "firebase_connected": True,
+            "collections": collection_names,
+            "majors_doc_exists": majors_doc.exists,
+            "majors_count": len(majors_doc.to_dict().get("majors", [])) if majors_doc.exists else 0
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.get("/categories")
 async def get_categories():
@@ -781,6 +918,50 @@ async def get_categories():
 @app.get("/major-colors")
 async def get_major_colors():
     return {"major_colors": major_colors}
+
+@app.get("/organizations")
+async def get_organizations():
+    """
+    Endpoint to get all organizations from the organizations dataframe.
+    Returns all organizations without filtering or scoring.
+    """
+    if orgs_df is None:
+        raise HTTPException(status_code=500, detail="Organizations data not available")
+    
+    try:
+        # Create a copy to avoid modifying the original dataframe
+        df_clean = orgs_df.copy()
+        
+        # Replace NaN, inf, and -inf values with None for JSON serialization
+        df_clean = df_clean.replace([float('inf'), float('-inf')], None)
+        df_clean = df_clean.where(pd.notna(df_clean), None)
+        
+        # Convert dataframe to list of dictionaries
+        organizations = df_clean.to_dict(orient='records')
+        
+        # Additional cleanup: recursively replace any remaining problematic float values
+        def clean_dict(d):
+            if isinstance(d, dict):
+                return {k: clean_dict(v) for k, v in d.items()}
+            elif isinstance(d, list):
+                return [clean_dict(item) for item in d]
+            elif isinstance(d, float):
+                if math.isnan(d) or math.isinf(d):
+                    return None
+                return d
+            return d
+        
+        organizations = clean_dict(organizations)
+        
+        return {
+            "organizations": organizations,
+            "count": len(organizations)
+        }
+    except Exception as e:
+        import traceback
+        print(f"Error in get_organizations: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error retrieving organizations: {str(e)}")
 
 @app.post("/signup")
 async def signup(user_data: UserProfile):
@@ -858,12 +1039,13 @@ async def get_recommendations(request: RecommendationRequest):
     if not all([orgs_df is not None, events_df is not None, tutoring_df is not None]):
         raise HTTPException(status_code=500, detail="Data not available")
     
-    if not db:
+    database = get_db()
+    if not database:
         raise HTTPException(status_code=500, detail="Database not available")
     
     try:
         # Get user data
-        user_doc = db.collection('users').document(request.user_email).get()
+        user_doc = database.collection('users').document(request.user_email).get()
         if not user_doc.exists:
             raise HTTPException(status_code=404, detail="User not found")
         
@@ -877,14 +1059,14 @@ async def get_recommendations(request: RecommendationRequest):
         ftcs_status = user_data.get('ftcs_status', 'No')
         gpa_range = user_data.get('gpa_range', '<2.0')
         major = user_data.get('major', 'Undeclared')
-        interests = user_data.get('interests', [])
+        interests = user_data.get('interests', []) or []
         academic_difficulty = user_data.get('academic_difficulty', 'Moderate')
         stress_level = user_data.get('stress_level', 'Low')
         satisfaction = user_data.get('satisfaction', 'Neutral')
         self_efficacy = user_data.get('self_efficacy', 'Moderate')
         financial_factors = user_data.get('financial_factors', 'N/A')
         family_responsibilities = user_data.get('family_responsibilities', 'N/A')
-        outside_encouragement = user_data.get('outside_encouragement', [])
+        outside_encouragement = user_data.get('outside_encouragement', []) or []
         
         # Calculate support ratings
         def calculate_social_support():
@@ -937,14 +1119,18 @@ async def get_recommendations(request: RecommendationRequest):
 
                 specific_majors = ast.literal_eval(row["Specific Majors"]) if row["Specific Majors"] else []
 
-                if year == "1" and row["Category"] in ["Cultural", "Social", "Recreation"]:
+                # Handle None values in Category field
+                category = row["Category"] or ""
+                
+                if year == "1" and category in ["Cultural", "Social", "Recreation"]:
                     score += social_support_rating/3
                     explanation_parts.append("This activity is ideal for first-year students to connect socially.")
-                elif year in ["3", "4", "5+"] and row["Category"] in ["Academic Interests", "Educational/Departmental"]:
+                elif year in ["3", "4", "5+"] and category in ["Academic Interests", "Educational/Departmental"]:
                     score += 1
                     explanation_parts.append("This activity provides valuable educational and departmental experience for upper-year students.")
 
-                matched_interests = any(interest in row["Category"] for interest in interests)
+                # Check if interests match
+                matched_interests = any(interest in category for interest in interests) if interests else False
                 if matched_interests:
                     score += 1
                     explanation_parts.append("This activity aligns with your interests.")
@@ -1131,87 +1317,217 @@ async def get_personalized_scholarships_endpoint(request: ScholarshipRequest):
 #University API
 @app.post("/universities")
 def create_universty(univ: UniversityModel):
-   doc_ref = db.collection("university").document(univ.short_hand.lower())
-   if doc_ref.get().exists:
-       raise HTTPException(status_code=400, detail="University already exists")
-   doc_ref.set(univ.dict())
-   return {"message": "University created successfully"}
+    try:
+        db_instance = get_db()
+        if db_instance is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize database connection")
+            
+        doc_ref = db_instance.collection("university").document(univ.short_hand.lower())
+        if doc_ref.get().exists:
+            raise HTTPException(status_code=400, detail="University already exists")
+        doc_ref.set(univ.dict())
+        return {"message": "University created successfully", "id": univ.short_hand.lower()}
+    except Exception as e:
+        print(f"Error creating university: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create university: {str(e)}")
 
-
-# Get a unviersity by name
+# Get a university by name
 @app.get("/universities/{short_hand}")
 def get_university(short_hand: str):
-   doc_ref = db.collection("university").document(short_hand.lower())
-   if not doc_ref.get().exists:
-       raise HTTPException(status_code=404, detail="University not found")
-   return doc_ref.get().to_dict()
+    try:
+        db_instance = get_db()
+        if db_instance is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize database connection")
+            
+        doc_ref = db_instance.collection("university").document(short_hand.lower())
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="University not found")
+        return doc.to_dict()
+    except Exception as e:
+        print(f"Error fetching university: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch university: {str(e)}")
 
 
 # Update a university
 @app.put("/universities/{short_hand}")
 def update_university(short_hand: str, univ: UniversityModel):
-   doc_ref = db.collection("university").document(short_hand.lower())
-   if not doc_ref.get().exists:
-       raise HTTPException(status_code=404, detail="University not found")
-   doc_ref.update(univ.dict())
-   return {"message": "University updated successfully"}
+    try:
+        db_instance = get_db()
+        if db_instance is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize database connection")
+            
+        doc_ref = db_instance.collection("university").document(short_hand.lower())
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="University not found")
+            
+        # Convert the UniversityModel to a dictionary and remove None values
+        update_data = {k: v for k, v in univ.dict().items() if v is not None}
+        doc_ref.update(update_data)
+        return {"message": "University updated successfully"}
+    except Exception as e:
+        print(f"Error updating university: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update university: {str(e)}")
 
 
 # Delete a university
 @app.delete("/universities/{short_hand}")
 def delete_university(short_hand: str):
-   doc_ref = db.collection("university").document(short_hand.lower())
-   if not doc_ref.get().exists:
-       raise HTTPException(status_code=404, detail="University not found")
-   doc_ref.delete()
-   return {"message": "University deleted successfully"}
+    try:
+        db_instance = get_db()
+        if db_instance is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize database connection")
+            
+        doc_ref = db_instance.collection("university").document(short_hand.lower())
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="University not found")
+            
+        doc_ref.delete()
+        return {"message": "University deleted successfully"}
+    except Exception as e:
+        print(f"Error deleting university: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete university: {str(e)}")
 
 
 # List all universities
 @app.get("/universities")
 def list_universities():
-   universities = db.collection("university").get()
-   return [university.to_dict() for university in universities]
+    try:
+        print(" Attempting to list universities...")
+        
+        # Use get_db() to ensure the database is properly initialized
+        print("Initializing database connection...")
+        db_instance = get_db()
+        if db_instance is None:
+            error_msg = " Failed to initialize database connection: get_db() returned None"
+            print(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
+        
+        print("Accessing 'university' collection...")
+        try:
+            universities_ref = db_instance.collection("university")
+            print("Successfully accessed 'university' collection")
+            
+            print("Fetching universities...")
+            universities = universities_ref.stream()
+            
+            # Convert Firestore documents to dictionaries
+            result = []
+            for university in universities:
+                try:
+                    result.append(university.to_dict())
+                except Exception as e:
+                    print(f"Error converting university document: {str(e)}")
+            
+            print(f"Successfully retrieved {len(result)} universities")
+            return result
+            
+        except Exception as e:
+            error_msg = f" Error accessing Firestore collection: {str(e)}"
+            print(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions as they are
+        raise
+        
+    except Exception as e:
+        error_msg = f" Unexpected error in list_universities: {str(e)}"
+        print(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
   
+
+# ------------------------------
+# Streaming Function
+# ------------------------------
+async def stream_chatgpt_response(websocket: WebSocket, messages: List[ChatGPTMessage],
+                                  user_email: str, model: str, temperature: float, max_tokens: int):
+    """
+    Streams the ChatGPT response token-by-token through WebSocket
+    """
+    try:
+        # Prepare messages
+        formatted_messages = [{"role": msg.role, "content": msg.content} for msg in messages]
+
+        # Check if the client is properly initialized
+        if not client:
+            await websocket.send_text("Error: OpenAI client is not initialized")
+            return
+        
+        # Get a non-streaming response and simulate streaming
+        try:
+            # Create a completion
+            response = client.chat.completions.create(
+                model=model,
+                messages=formatted_messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            
+            # Get the response content
+            content = response.choices[0].message.content
+            
+            # Send the content in chunks to simulate streaming
+            chunk_size = 4  # Send 4 characters at a time
+            for i in range(0, len(content), chunk_size):
+                chunk = content[i:i+chunk_size]
+                await websocket.send_text(chunk)
+                # Small delay to simulate streaming
+                await asyncio.sleep(0.05)
+            
+            # Send end marker
+            await websocket.send_text("\n[END]")
+            
+        except Exception as inner_e:
+            print(f"Error in chat completion: {str(inner_e)}")
+            await websocket.send_text(f"Error in chat completion: {str(inner_e)}")
+
+    except Exception as e:
+        error_message = f"Error in stream_chatgpt_response: {str(e)}"
+        print(error_message)
+        await websocket.send_text(error_message)
 
 # ChatGPT API Endpoints
 
+# ------------------------------
+# WebSocket Endpoint
+# ------------------------------
 @app.websocket("/ws/chatgpt/{user_email}")
 async def chatgpt_websocket(websocket: WebSocket, user_email: str):
     """
     WebSocket endpoint for streaming ChatGPT responses
     """
     try:
-        # Connect to the WebSocket
+        # Connect WebSocket client
         await chatgpt_manager.connect(websocket, user_email)
-        
-        # Process messages
+
+        # Process incoming messages
         while True:
-            # Wait for a message from the client
             data = await websocket.receive_text()
-            
-            # Parse the message
+
             try:
                 message_data = json.loads(data)
-                
-                # Create ChatGPT messages
                 messages = []
+
+                # Add system prompt if provided
                 if "system" in message_data and message_data["system"]:
                     messages.append(ChatGPTMessage(role="system", content=message_data["system"]))
-                
+
                 # Add user message
                 if "message" in message_data and message_data["message"]:
                     messages.append(ChatGPTMessage(role="user", content=message_data["message"]))
                 else:
                     await websocket.send_text("Error: No message provided")
                     continue
-                
-                # Get model parameters
+
+                # Extract model parameters
                 model = message_data.get("model", "gpt-4o-mini")
                 temperature = message_data.get("temperature", 0.7)
                 max_tokens = message_data.get("max_tokens", 150)
-                
-                # Stream the response
+
+                # Stream response
                 await stream_chatgpt_response(
                     websocket=websocket,
                     messages=messages,
@@ -1220,14 +1536,13 @@ async def chatgpt_websocket(websocket: WebSocket, user_email: str):
                     temperature=temperature,
                     max_tokens=max_tokens
                 )
-                
+
             except json.JSONDecodeError:
                 await websocket.send_text("Error: Invalid JSON format")
             except Exception as e:
                 await websocket.send_text(f"Error: {str(e)}")
-    
+
     except WebSocketDisconnect:
-        # Handle disconnection
         chatgpt_manager.disconnect(user_email)
         print(f"Client disconnected: {user_email}")
 
@@ -1416,11 +1731,28 @@ async def get_calendar_events(request: CalendarRequest = None):
       color?: string;
     }
     """
-    if calendar_df is None:
-        raise HTTPException(status_code=500, detail="Calendar data not available")
+    # Safely access the global calendar_df which may not be defined if startup failed early
+    global calendar_df
+    try:
+        df = calendar_df  # type: ignore[name-defined]
+    except NameError:
+        df = None
+
+    if df is None:
+        # Try to load from local file as fallback
+        try:
+            if os.path.exists("utd_events.csv"):
+                df = pd.read_csv("utd_events.csv")
+                calendar_df = df  # Update global variable
+                print("Calendar data loaded from local file for /calendar endpoint")
+            else:
+                raise HTTPException(status_code=500, detail="Calendar data not available")
+        except Exception as e:
+            print(f"Error loading local calendar data: {e}")
+            raise HTTPException(status_code=500, detail="Calendar data not available")
     
     # Create a copy of the dataframe to avoid modifying the original
-    filtered_events = calendar_df.copy()
+    filtered_events = df.copy()
     
     # Apply filters if provided
     if request:
@@ -1523,6 +1855,7 @@ async def get_calendar_events(request: CalendarRequest = None):
     return {"events": events_list, "count": len(events_list)}
 @app.get("/today-events")
 async def get_today_events():
+    global calendar_df
     """
     Endpoint to get today's events from utd_events.csv.
     
@@ -1539,7 +1872,16 @@ async def get_today_events():
     }
     """
     if calendar_df is None:
-        raise HTTPException(status_code=500, detail="Calendar data not available")
+        # Try to load from local file as fallback
+        try:
+            if os.path.exists("utd_events.csv"):
+                calendar_df = pd.read_csv("utd_events.csv")
+                print("Calendar data loaded from local file for today-events")
+            else:
+                raise HTTPException(status_code=500, detail="Calendar data not available")
+        except Exception as e:
+            print(f"Error loading local calendar data: {e}")
+            raise HTTPException(status_code=500, detail="Calendar data not available")
     
     # Create a copy of the dataframe to avoid modifying the original
     filtered_events = calendar_df.copy()
